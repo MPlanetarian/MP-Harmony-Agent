@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+import readline
+import threading
+import httpx
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from openai_harmony import (
+    load_harmony_encoding,
+    HarmonyEncodingName,
+    Role,
+    Author,
+    Message,
+    Conversation,
+    DeveloperContent,
+    SystemContent,
+    ToolDescription,
+)
+
+# ---------------------------------------------------------------------------
+# Global Settings & Configuration
+# ---------------------------------------------------------------------------
+AGENT_PORT = 11435
+NUM_CTX = 8192
+NUM_PREDICT = 4096
+PRUNE_THRESHOLD = 6000
+SAFE_MODE = True
+MEMORY_FILE = os.path.expanduser("~/.harmony_memory.json")
+JOBS_DIR = "/tmp/ha_jobs"
+os.makedirs(JOBS_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# 1. Local Tools Implementation
+# ---------------------------------------------------------------------------
+def read_file(filepath: str) -> dict:
+    """Reads the entire content of a file (<64KB)."""
+    try:
+        path = os.path.expanduser(filepath)
+        if not os.path.exists(path):
+            return {"error": f"File does not exist: {path}"}
+        if os.path.getsize(path) > 65536:
+            return {"error": "File exceeds 64KB. Use 'read_file_lines' or 'search_file_regex'."}
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return {"filepath": path, "content": f.read()}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def read_file_lines(filepath: str, start_line: int = 1, end_line: int = 200) -> dict:
+    """Reads a targeted slice of lines with line numbers (max 250 lines)."""
+    try:
+        path = os.path.expanduser(filepath)
+        if not os.path.exists(path):
+            return {"error": f"File does not exist: {path}"}
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        total = len(lines)
+        start = max(1, int(start_line))
+        end = min(total, min(int(end_line), start + 249))
+        if start > total:
+            return {"error": f"start_line ({start}) exceeds total line count ({total})."}
+        numbered = [f"{i}: {line}" for i, line in enumerate(lines[start - 1 : end], start=start)]
+        return {"filepath": path, "total_lines": total, "range": f"{start}-{end}", "content": "".join(numbered)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def search_file_regex(filepath: str, pattern: str, max_results: int = 15) -> dict:
+    """Searches a file for regex matches returning line numbers and context."""
+    try:
+        path = os.path.expanduser(filepath)
+        if not os.path.exists(path):
+            return {"error": f"File does not exist: {path}"}
+        regex = re.compile(pattern, re.IGNORECASE)
+        matches = []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for idx, line in enumerate(f, start=1):
+                if regex.search(line):
+                    matches.append({"line": idx, "content": line.strip()})
+                    if len(matches) >= int(max_results):
+                        break
+        return {"filepath": path, "matches": matches, "count": len(matches)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def write_file(filepath: str, content: str) -> dict:
+    """Overwrites or creates a file with automatic .bak backup."""
+    try:
+        path = os.path.expanduser(filepath)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        backup = None
+        if os.path.exists(path):
+            backup = f"{path}.bak"
+            shutil.copy2(path, backup)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        if path.endswith(".sh"):
+            os.chmod(path, 0o755)
+        res = {"filepath": path, "status": "written successfully", "bytes": len(content)}
+        if backup:
+            res["backup"] = backup
+        return res
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def patch_file(filepath: str, old_str: str, new_str: str) -> dict:
+    """Exact string replacement with .bak backup."""
+    try:
+        path = os.path.expanduser(filepath)
+        if not os.path.exists(path):
+            return {"error": f"File does not exist: {path}"}
+        with open(path, "r", encoding="utf-8") as f:
+            orig = f.read()
+        if old_str not in orig:
+            return {"error": "Exact target string not found in file."}
+        backup = f"{path}.bak"
+        shutil.copy2(path, backup)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(orig.replace(old_str, new_str, 1))
+        return {"filepath": path, "status": "patched successfully", "backup": backup}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def patch_file_diff(filepath: str, diff_patch: str) -> dict:
+    """Applies a standard unified diff patch to a target file via patch."""
+    try:
+        path = os.path.expanduser(filepath)
+        if not os.path.exists(path):
+            return {"error": f"File does not exist: {path}"}
+        backup = f"{path}.bak"
+        shutil.copy2(path, backup)
+        proc = subprocess.run(
+            ["patch", "-u", path],
+            input=diff_patch,
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            shutil.copy2(backup, path)
+            return {"error": f"Patch failed: {proc.stderr or proc.stdout}. File restored."}
+        return {"filepath": path, "status": "unified diff applied", "backup": backup}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def run_shell_command(command: str) -> dict:
+    """Executes a short foreground bash command with safe_mode protection."""
+    if SAFE_MODE:
+        destructive = [
+            r"\brm\s+-[rf]{1,2}\b",
+            r"\bmkfs\b",
+            r"\bdd\s+if=",
+            r"\bshutdown\b",
+            r"\breboot\b",
+            r"\bgit\s+reset\s+--hard\b",
+        ]
+        for pat in destructive:
+            if re.search(pat, command):
+                return {"error": f"Command blocked by safe_mode guardrail: dangerous pattern ('{pat}')."}
+    try:
+        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+        return {"stdout": res.stdout.strip(), "stderr": res.stderr.strip(), "returncode": res.returncode}
+    except subprocess.TimeoutExpired:
+        return {"error": "Command timed out after 30 seconds. For longer tasks, use 'start_background_task'."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def start_background_task(command: str) -> dict:
+    """Spawns a long-running process in the background and returns a tracking job_id."""
+    job_id = f"job_{int(time.time())}_{str(uuid.uuid4())[:4]}"
+    log_file = os.path.join(JOBS_DIR, f"{job_id}.log")
+    try:
+        with open(log_file, "w") as out:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=out,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return {"job_id": job_id, "pid": proc.pid, "log_file": log_file, "status": "started"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def check_background_task(job_id: str, tail_lines: int = 20) -> dict:
+    """Inspects exit status and output tail of a background task."""
+    log_file = os.path.join(JOBS_DIR, f"{job_id}.log")
+    if not os.path.exists(log_file):
+        return {"error": f"No job found with id '{job_id}'."}
+    tail_cmd = f"tail -n {tail_lines} '{log_file}'"
+    tail_res = subprocess.run(tail_cmd, shell=True, capture_output=True, text=True)
+    return {"job_id": job_id, "recent_logs": tail_res.stdout.strip()}
+
+
+def get_system_telemetry() -> dict:
+    """Collects CPU load, host RAM/swap, and NVIDIA GPU telemetry."""
+    telemetry = {}
+    try:
+        with open("/proc/loadavg", "r") as f:
+            telemetry["load_avg_1_5_15m"] = f.read().strip().split()[:3]
+        mem = subprocess.run("free -h", shell=True, capture_output=True, text=True)
+        telemetry["memory"] = mem.stdout.strip().splitlines()[:2]
+    except Exception as e:
+        telemetry["cpu_mem_error"] = str(e)
+
+    try:
+        nvidia_cmd = "nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits"
+        nv = subprocess.run(nvidia_cmd, shell=True, capture_output=True, text=True)
+        if nv.returncode == 0 and nv.stdout.strip():
+            fields = [x.strip() for x in nv.stdout.strip().split(",")]
+            telemetry["gpu"] = {
+                "model": fields[0],
+                "utilization": f"{fields[1]}%",
+                "vram_used": f"{fields[2]} MB",
+                "vram_total": f"{fields[3]} MB",
+                "temp": f"{fields[4]} °C",
+            }
+    except Exception:
+        pass
+    return telemetry
+
+
+def git_checkpoint(repo_path: str, message: str) -> dict:
+    """Creates a temporary safety commit or stash in a git repository."""
+    path = os.path.expanduser(repo_path)
+    tag = f"harmony_ckpt_{int(time.time())}"
+    cmd = f"cd '{path}' && git add -A && git commit -m 'checkpoint: {message} ({tag})' || git stash create"
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return {"repo": path, "checkpoint_tag": tag, "output": res.stdout.strip() or res.stderr.strip()}
+
+
+def git_rollback(repo_path: str) -> dict:
+    """Reverts changes in a repo back to the previous commit."""
+    path = os.path.expanduser(repo_path)
+    cmd = f"cd '{path}' && git reset --hard HEAD~1"
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    return {"repo": path, "status": "rolled back", "output": res.stdout.strip()}
+
+
+def set_agent_memory(key: str, value: str) -> dict:
+    """Saves a persistent configuration key-value pair to disk."""
+    memories = {}
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                memories = json.load(f)
+        except Exception:
+            pass
+    memories[key] = value
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memories, f, indent=2)
+    return {"status": "saved", "key": key, "value": value}
+
+
+def get_agent_memory(key: str) -> dict:
+    """Retrieves a persistent configuration key-value pair."""
+    if not os.path.exists(MEMORY_FILE):
+        return {"error": "No memory file initialized."}
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            memories = json.load(f)
+        return {"key": key, "value": memories.get(key, None)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def list_agent_memories() -> dict:
+    """Lists all stored persistent configuration facts."""
+    if not os.path.exists(MEMORY_FILE):
+        return {"memories": {}}
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            return {"memories": json.load(f)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def web_search(query: str, max_results: int = 5) -> dict:
+    """Searches the live web via DuckDuckGo without API keys."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return {"error": "Neither 'ddgs' nor 'duckduckgo_search' installed."}
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for item in ddgs.text(query, max_results=int(max_results)):
+                results.append({"title": item.get("title", ""), "snippet": item.get("body", "")[:300], "url": item.get("href", "")})
+        return {"query": query, "results": results, "count": len(results)}
+    except Exception as e:
+        return {"error": f"Search failed: {str(e)}"}
+
+
+AVAILABLE_TOOLS = {
+    "read_file": read_file,
+    "read_file_lines": read_file_lines,
+    "search_file_regex": search_file_regex,
+    "write_file": write_file,
+    "patch_file": patch_file,
+    "patch_file_diff": patch_file_diff,
+    "run_shell_command": run_shell_command,
+    "start_background_task": start_background_task,
+    "check_background_task": check_background_task,
+    "get_system_telemetry": get_system_telemetry,
+    "git_checkpoint": git_checkpoint,
+    "git_rollback": git_rollback,
+    "set_agent_memory": set_agent_memory,
+    "get_agent_memory": get_agent_memory,
+    "list_agent_memories": list_agent_memories,
+    "web_search": web_search,
+}
+
+# ---------------------------------------------------------------------------
+# 2. Tool Schemas Registered for Harmony
+# ---------------------------------------------------------------------------
+tool_schemas = [
+    ToolDescription(name="read_file", description="Reads small files (<64KB).", parameters={"type": "object", "properties": {"filepath": {"type": "string"}}, "required": ["filepath"]}),
+    ToolDescription(name="read_file_lines", description="Reads a line slice (max 250) with line numbers.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["filepath"]}),
+    ToolDescription(name="search_file_regex", description="Searches massive files for regex patterns.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "pattern": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["filepath", "pattern"]}),
+    ToolDescription(name="write_file", description="Writes file with .bak backup.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}),
+    ToolDescription(name="patch_file", description="Replaces exact code block with backup.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}}, "required": ["filepath", "old_str", "new_str"]}),
+    ToolDescription(name="patch_file_diff", description="Applies unified diff patch syntax directly to a file.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "diff_patch": {"type": "string"}}, "required": ["filepath", "diff_patch"]}),
+    ToolDescription(name="run_shell_command", description="Executes short bash command (<30s).", parameters={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+    ToolDescription(name="start_background_task", description="Launches long job detached; returns job_id.", parameters={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}),
+    ToolDescription(name="check_background_task", description="Checks log tail and status of a background job.", parameters={"type": "object", "properties": {"job_id": {"type": "string"}, "tail_lines": {"type": "integer"}}, "required": ["job_id"]}),
+    ToolDescription(name="get_system_telemetry", description="Reads CPU, host RAM, and NVIDIA GPU telemetry (load, VRAM, temp).", parameters={"type": "object", "properties": {}}),
+    ToolDescription(name="git_checkpoint", description="Creates safety checkpoint in git repo.", parameters={"type": "object", "properties": {"repo_path": {"type": "string"}, "message": {"type": "string"}}, "required": ["repo_path", "message"]}),
+    ToolDescription(name="git_rollback", description="Rolls back repo to previous commit.", parameters={"type": "object", "properties": {"repo_path": {"type": "string"}}, "required": ["repo_path"]}),
+    ToolDescription(name="set_agent_memory", description="Saves a key-value fact to persistent storage.", parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}),
+    ToolDescription(name="get_agent_memory", description="Retrieves a persistent key-value fact.", parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}),
+    ToolDescription(name="list_agent_memories", description="Lists all persistent key-value facts.", parameters={"type": "object", "properties": {}}),
+    ToolDescription(name="web_search", description="Live web search via DuckDuckGo.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
+]
+
+# ---------------------------------------------------------------------------
+# 3. Model Inspection, Encodings & Live Streaming Pipeline
+# ---------------------------------------------------------------------------
+def detect_ollama_model() -> str:
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if args:
+        return args[0]
+    try:
+        res = httpx.get("http://localhost:11434/api/tags", timeout=5.0)
+        models = [m["name"] for m in res.json().get("models", [])]
+        for m in models:
+            if "gpt-oss" in m.lower():
+                return m
+        return models[0] if models else "gpt-oss-pinned:latest"
+    except Exception:
+        return "gpt-oss-pinned:latest"
+
+
+def get_ollama_model_info(model_name: str) -> dict:
+    try:
+        res = httpx.post("http://localhost:11434/api/show", json={"name": model_name}, timeout=5.0)
+        return res.json() if res.status_code == 200 else {}
+    except Exception:
+        return {}
+
+
+def prune_conversation_if_needed(convo: Conversation, enc) -> int:
+    tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+    current = len(tokens)
+    pinned = 2
+    pruned = 0
+    while current > PRUNE_THRESHOLD and len(convo.messages) > (pinned + 2):
+        convo.messages.pop(pinned)
+        pruned += 1
+        tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+        current = len(tokens)
+    if pruned:
+        print(f"\033[1;33m[Context Window]\033[0m Pruned {pruned} messages. Active tokens: {current:,}")
+    return current
+
+
+def stream_ollama_with_callback(prompt_text: str, model_name: str, on_token=None, stop_event: threading.Event = None) -> str:
+    """Streams token chunks live from Ollama with repetition penalty and loop-break guardrail."""
+    full = []
+    recent_sliding = []
+    
+    with httpx.stream(
+        "POST",
+        "http://localhost:11434/api/generate",
+        json={
+            "model": model_name,
+            "prompt": prompt_text,
+            "raw": True,
+            "stream": True,
+            "options": {
+                "stop": ["<|return|>", "<|call|>"],
+                "num_ctx": NUM_CTX,
+                "num_predict": NUM_PREDICT,
+                "temperature": 0.35,      # Elevated from 0.2 to deter deterministic cyclic attractors
+                "repeat_penalty": 1.18,    # Penalizes n-gram loops
+                "repeat_last_n": 128,
+                "top_p": 0.9,
+            },
+        },
+        timeout=300.0,
+    ) as response:
+        if response.status_code != 200:
+            raise RuntimeError(f"Ollama error {response.status_code}: {response.text}")
+        for line in response.iter_lines():
+            if stop_event and stop_event.is_set():
+                print("\n\033[1;31m[Inference Aborted]\033[0m")
+                break
+            if not line:
+                continue
+            chunk = json.loads(line)
+            piece = chunk.get("response", "")
+            print(piece, end="", flush=True)
+            full.append(piece)
+
+            # Circuit breaker against degenerate repetition loops
+            recent_sliding.append(piece)
+            if len(recent_sliding) > 30:
+                recent_sliding.pop(0)
+                tail_str = "".join(recent_sliding)
+                # Detect identical phrases of 12-25 characters repeated >= 4 times
+                m_loop = re.search(r"(.{12,25}?)\1{3,}", tail_str)
+                if m_loop:
+                    print("\n\033[1;31m[Circuit Breaker]\033[0m Cyclic repetition loop detected. Halting generation turn.")
+                    break
+
+            if on_token:
+                on_token(piece)
+    print()
+    return "".join(full)
+
+
+def extract_content_text(msg) -> str:
+    parts = []
+    for part in msg.content:
+        if hasattr(part, "text"):
+            parts.append(part.text)
+        elif isinstance(part, str):
+            parts.append(part)
+    return "".join(parts)
+
+
+def init_agent():
+    enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    sys_content = SystemContent.new()
+    
+    memory_summary = ""
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                mem_data = json.load(f)
+                if mem_data:
+                    memory_summary = " Persistent Environment Memories: " + json.dumps(mem_data)
+        except Exception:
+            pass
+
+    dev_content = (
+        DeveloperContent.new()
+        .with_instructions(
+            "You are an autonomous local system administration, scripting, and technical research assistant. "
+            "When modifying files, running commands, monitoring hardware, or managing long background tasks, "
+            "YOU MUST ALWAYS INVOKE YOUR PROVIDED TOOLS. "
+            "For large files (>300 lines), NEVER read them entirely: use `search_file_regex` or `read_file_lines`. "
+            "For multi-file modifications, use `git_checkpoint`. "
+            "For commands running longer than 30s, use `start_background_task`. "
+            "When asked to write a review, report, or recommendations to a file, compose the text directly "
+            "and invoke `write_file` to save it to disk. Do NOT loop repetitive statements in your analysis scratchpad. "
+            "Summarize all voice replies concisely in the final channel."
+            + memory_summary
+        )
+        .with_function_tools(tool_schemas)
+    )
+
+    convo = Conversation.from_messages([
+        Message.from_role_and_content(Role.SYSTEM, sys_content),
+        Message.from_role_and_content(Role.DEVELOPER, dev_content),
+    ])
+    return enc, convo
+
+
+# ---------------------------------------------------------------------------
+# 4. Voice Bridge Server with Real-Time SSE Forwarding & Socket Safety
+# ---------------------------------------------------------------------------
+GLOBAL_STATE = {
+    "lock": threading.Lock(),
+    "abort_event": threading.Event(),
+}
+
+class HarmonyBridgeHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def send_sse_chunk(self, content_str: str) -> bool:
+        """Sends an SSE delta chunk. Catches BrokenPipeError/ConnectionResetError if client disconnects."""
+        try:
+            chunk = {
+                "id": "chatcmpl-harmony",
+                "object": "chat.completion.chunk",
+                "choices": [{"delta": {"content": content_str}, "index": 0}],
+            }
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError):
+            print("\n\033[1;33m[Client Disconnected]\033[0m Voice client closed the socket prematurely.")
+            return False
+        except Exception as e:
+            print(f"\n\033[1;31m[SSE Write Error]\033[0m {e}")
+            return False
+
+    def do_POST(self):
+        # 1. Voice Interruption / Barge-in Endpoint
+        if self.path == "/v1/abort":
+            GLOBAL_STATE["abort_event"].set()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                self.wfile.write(b'{"status":"aborted"}')
+            except Exception:
+                pass
+            print("\033[1;31m[Barge-In]\033[0m Abort signal triggered via /v1/abort.")
+            return
+
+        if self.path != "/v1/chat/completions":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        GLOBAL_STATE["abort_event"].clear()
+        content_length = int(self.headers.get("Content-Length", 0))
+        data = json.loads(self.rfile.read(content_length).decode("utf-8"))
+
+        messages = data.get("messages", [])
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_user_msg = m.get("content", "").strip()
+                break
+
+        if not last_user_msg:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        print(f"\n\033[1;35m[Voice Input Heard]\033[0m {last_user_msg}")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        enc = GLOBAL_STATE["enc"]
+        convo = GLOBAL_STATE["convo"]
+        model_name = GLOBAL_STATE["model_name"]
+
+        # Voice session reset trigger
+        if last_user_msg.lower() in ("/reset", "reset", "clear session", "reset context"):
+            with GLOBAL_STATE["lock"]:
+                new_enc, new_convo = init_agent()
+                GLOBAL_STATE["convo"] = new_convo
+            self.send_sse_chunk("Session memory cleared to baseline.")
+            try:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            except Exception:
+                pass
+            self.close_connection = True
+            return
+
+        with GLOBAL_STATE["lock"]:
+            prune_conversation_if_needed(convo, enc)
+            convo.messages.append(Message.from_role_and_content(Role.USER, last_user_msg))
+
+            step = 0
+            client_alive = True
+
+            while step < 8 and client_alive:
+                if GLOBAL_STATE["abort_event"].is_set():
+                    break
+                step += 1
+                prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+                prompt_text = enc.decode(prompt_tokens)
+
+                print(f"\033[1;30m[Agent Step {step}] Generating...\033[0m")
+
+                # Channel parser state machine for real-time streaming
+                raw_token_window = []
+                final_channel_active = [False]
+                sentence_buffer = [""]
+
+                def live_token_callback(piece: str):
+                    nonlocal client_alive
+                    if not client_alive or GLOBAL_STATE["abort_event"].is_set():
+                        return
+
+                    raw_token_window.append(piece)
+                    window = "".join(raw_token_window[-12:])
+
+                    # Identify entry into the final user channel
+                    if "final<|message|>" in window or (not final_channel_active[0] and "final" in window and "<|message|>" in piece):
+                        final_channel_active[0] = True
+                        return
+
+                    # Identify exit from channel
+                    if final_channel_active[0] and ("<|end|>" in piece or "<|call|>" in piece):
+                        final_channel_active[0] = False
+                        return
+
+                    # Forward sentence chunks live
+                    if final_channel_active[0]:
+                        clean_piece = re.sub(r"<\|.*?\|>", "", piece)
+                        if clean_piece:
+                            sentence_buffer[0] += clean_piece
+                            while re.search(r"[\.\!\?\n]\s", sentence_buffer[0]):
+                                m = re.search(r"[\.\!\?\n]\s", sentence_buffer[0])
+                                idx = m.end()
+                                chunk_to_send = sentence_buffer[0][:idx]
+                                sentence_buffer[0] = sentence_buffer[0][idx:]
+                                if not self.send_sse_chunk(chunk_to_send):
+                                    client_alive = False
+                                    GLOBAL_STATE["abort_event"].set()
+                                    break
+
+                raw_response = stream_ollama_with_callback(
+                    prompt_text,
+                    model_name,
+                    on_token=live_token_callback,
+                    stop_event=GLOBAL_STATE["abort_event"],
+                )
+
+                # Flush any residual text in the buffer
+                if sentence_buffer[0].strip() and client_alive and not GLOBAL_STATE["abort_event"].is_set():
+                    self.send_sse_chunk(sentence_buffer[0])
+
+                resp_tokens = enc.encode(raw_response, allowed_special="all")
+                parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
+                convo.messages.extend(parsed_messages)
+
+                tool_called = False
+                for msg in parsed_messages:
+                    if msg.recipient and msg.recipient.startswith("functions."):
+                        tool_called = True
+                        func_name = msg.recipient.split("functions.", 1)[1]
+                        raw_args = extract_content_text(msg)
+                        try:
+                            kwargs = json.loads(raw_args)
+                        except Exception:
+                            kwargs = {}
+
+                        print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
+                        print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
+
+                        res = AVAILABLE_TOOLS[func_name](**kwargs) if func_name in AVAILABLE_TOOLS else {"error": f"Tool '{func_name}' not found."}
+                        preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
+                        print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
+
+                        convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
+
+                if not tool_called:
+                    break
+
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+        self.close_connection = True
+
+
+# ---------------------------------------------------------------------------
+# 5. CLI Banner & Main Loop
+# ---------------------------------------------------------------------------
+def print_banner(model_name: str, model_info: dict):
+    details = model_info.get("details", {})
+    raw_info = model_info.get("model_info", {})
+    arch = details.get("family", "Unknown")
+    param_size = details.get("parameter_size", "Unknown")
+    quant = details.get("quantization_level", "Unknown")
+    ctx_len = next((f"{v:,} tokens" for k, v in raw_info.items() if k.endswith(".context_length")), "Unknown")
+
+    print("\033[1;36m======================================================================\033[0m")
+    print("\033[1;37m   OpenAI Harmony Advanced Autonomous Engineering Agent\033[0m")
+    print("\033[1;36m======================================================================\033[0m")
+    print(f" \033[1mModel Tag\033[0m         : \033[1;32m{model_name}\033[0m")
+    print(f" \033[1mArchitecture\033[0m      : {arch.upper()} | {param_size} | {quant}")
+    print(f" \033[1mNative Context\033[0m    : {ctx_len}")
+    print(f" \033[1mTools Active\033[0m      : {len(AVAILABLE_TOOLS)} registered (diff, telemetry, jobs, memory, git, web)")
+    print(f" \033[1mGuardrails\033[0m        : safe_mode={'ON' if SAFE_MODE else 'OFF'} | auto-pruner={PRUNE_THRESHOLD} tok")
+    print("\033[1;36m----------------------------------------------------------------------\033[0m")
+
+
+def main():
+    model_name = detect_ollama_model()
+    model_info = get_ollama_model_info(model_name)
+    if not model_info:
+        print(f"\033[1;31m[Error]\033[0m Model '{model_name}' not found in Ollama.")
+        sys.exit(1)
+
+    print_banner(model_name, model_info)
+    enc, convo = init_agent()
+
+    if "--server" in sys.argv or "-s" in sys.argv:
+        GLOBAL_STATE["enc"] = enc
+        GLOBAL_STATE["convo"] = convo
+        GLOBAL_STATE["model_name"] = model_name
+
+        server = HTTPServer(("127.0.0.1", AGENT_PORT), HarmonyBridgeHandler)
+        print(f"\033[1;32m[Voice Bridge Active]\033[0m Listening at http://127.0.0.1:{AGENT_PORT}/v1/chat/completions")
+        print(f"\033[1;32m[Abort Endpoint]\033[0m POST http://127.0.0.1:{AGENT_PORT}/v1/abort")
+        print("\033[1;36m======================================================================\033[0m\n")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down server.")
+            server.server_close()
+        return
+
+    # Interactive CLI Mode
+    print(" Commands: '/reset' to wipe history, 'exit' or Ctrl+C to quit.\n")
+    while True:
+        try:
+            user_input = input("\n\033[1;34mYou >\033[0m ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting.")
+            break
+        if not user_input:
+            continue
+        if user_input.lower() in ("exit", "quit"):
+            break
+        if user_input.lower() in ("/reset", "reset", "clear"):
+            enc, convo = init_agent()
+            print("\033[1;32m[Reset]\033[0m Conversation cleared.")
+            continue
+
+        prune_conversation_if_needed(convo, enc)
+        convo.messages.append(Message.from_role_and_content(Role.USER, user_input))
+
+        step = 0
+        while step < 8:
+            step += 1
+            prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+            prompt_text = enc.decode(prompt_tokens)
+
+            print(f"\033[1;30m[Agent Step {step}] Generating...\033[0m")
+            raw_response = stream_ollama_with_callback(prompt_text, model_name)
+
+            resp_tokens = enc.encode(raw_response, allowed_special="all")
+            parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
+            convo.messages.extend(parsed_messages)
+
+            tool_called = False
+            for msg in parsed_messages:
+                if msg.recipient and msg.recipient.startswith("functions."):
+                    tool_called = True
+                    func_name = msg.recipient.split("functions.", 1)[1]
+                    raw_args = extract_content_text(msg)
+                    try:
+                        kwargs = json.loads(raw_args)
+                    except Exception:
+                        kwargs = {}
+
+                    print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
+                    print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
+
+                    res = AVAILABLE_TOOLS[func_name](**kwargs) if func_name in AVAILABLE_TOOLS else {"error": f"Tool '{func_name}' not found."}
+                    preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
+                    print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
+
+                    convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
+
+            if not tool_called:
+                break
+
+
+if __name__ == "__main__":
+    main()
