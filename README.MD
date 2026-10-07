@@ -1,4 +1,4 @@
-# Harmony Agent (`HA.py`)
+# MP Harmony Agent (`MP_Harmony_Agent.py`)
 
 A local autonomous system administration, scripting, and research agent powered by the **OpenAI Harmony** specification and **Ollama**. `HA.py` bridges low-level OS management (file inspection, code patching, regex search, live web search, and shell execution) with hands-free voice control via `local-voice-talk`.
 
