@@ -1162,7 +1162,16 @@ def main():
         GLOBAL_STATE["convo"] = convo
         GLOBAL_STATE["model_name"] = model_name
 
-        server = HTTPServer(("127.0.0.1", AGENT_PORT), HarmonyBridgeHandler)
+        try:
+            server = HTTPServer(("127.0.0.1", AGENT_PORT), HarmonyBridgeHandler)
+        except OSError as e:
+            if getattr(e, 'errno', None) == 98 or "Address already in use" in str(e):
+                print(f"\n\033[1;31m[Error] Port {AGENT_PORT} is already in use by another running instance of MP Harmony Agent.\033[0m")
+                print(f"\033[1;33mThe Voice Bridge is already active. To restart, stop the existing instance first via Option 8 or Option 7 in the Manager.\033[0m\n")
+            else:
+                print(f"\n\033[1;31m[Error starting server]\033[0m {e}\n")
+            return
+
         print(f"\033[1;32m[Voice Bridge Active]\033[0m Listening at http://127.0.0.1:{AGENT_PORT}/v1/chat/completions")
         print(f"\033[1;32m[Abort Endpoint]\033[0m POST http://127.0.0.1:{AGENT_PORT}/v1/abort")
         print("\033[1;36m======================================================================\033[0m\n")
