@@ -1957,35 +1957,41 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        # 5. OpenAI Model Discovery: /v1/models
-        if path in ("/v1/models", "/models"):
+        # 5. OpenAI Model Discovery: /v1/models or /v1/models/<id>
+        if path in ("/v1/models", "/models") or path.startswith(("/v1/models/", "/models/")):
             model_name = GLOBAL_STATE.get("model_name", "gpt-oss-pinned:latest")
             models_data = [
                 {
-                    "id": model_name,
+                    "id": "mp-harmony-agent",
+                    "name": "MP Harmony AI Agent",
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "harmony-agent",
+                    "owned_by": "mp-harmony",
+                    "permission": [],
+                    "root": "mp-harmony-agent",
+                    "parent": None,
+                },
+                {
+                    "id": model_name,
+                    "name": f"MP Harmony ({model_name})",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "mp-harmony",
                     "permission": [],
                     "root": model_name,
                     "parent": None,
-                }
+                },
             ]
-            if model_name != "gpt-oss-pinned:latest":
-                models_data.append({
-                    "id": "gpt-oss-pinned:latest",
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "harmony-agent",
-                    "permission": [],
-                    "root": "gpt-oss-pinned:latest",
-                    "parent": None,
-                })
-            resp = {
-                "object": "list",
-                "data": models_data,
-            }
-            body = json.dumps(resp).encode("utf-8")
+            if path.startswith(("/v1/models/", "/models/")):
+                req_id = path.split("/models/", 1)[1]
+                matched = next((m for m in models_data if m["id"] == req_id), models_data[0])
+                body = json.dumps(matched).encode("utf-8")
+            else:
+                resp = {
+                    "object": "list",
+                    "data": models_data,
+                }
+                body = json.dumps(resp).encode("utf-8")
             self.send_response(200)
             self.send_cors_headers()
             self.send_header("Content-Type", "application/json")
@@ -2071,6 +2077,8 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                 chunk = {
                     "id": "chatcmpl-harmony",
                     "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": getattr(self, "current_model", "mp-harmony-agent"),
                     "choices": [{"delta": {"content": content_str}, "index": 0}],
                 }
                 self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
@@ -2187,6 +2195,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
 
         enc = GLOBAL_STATE["enc"]
         model_name = GLOBAL_STATE["model_name"]
+        self.current_model = data.get("model", "mp-harmony-agent")
 
         # Voice session reset trigger
         if last_user_msg.lower() in ("/reset", "reset", "clear session", "reset context"):
@@ -2383,7 +2392,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
                         "object": "chat.completion",
                         "created": int(time.time()),
-                        "model": model_name,
+                        "model": getattr(self, "current_model", model_name),
                         "choices": [
                             {
                                 "index": 0,
