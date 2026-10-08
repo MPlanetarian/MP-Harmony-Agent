@@ -12,6 +12,7 @@ import threading
 import inspect
 import wave
 import queue
+import io
 import urllib.parse
 import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -423,6 +424,35 @@ def list_agent_memories(**kwargs) -> dict:
         return {"error": str(e)}
 
 
+def search_agent_memories(query: str = "", **kwargs) -> dict:
+    """Searches stored persistent memories using multi-term keyword overlap and relevance ranking."""
+    if not os.path.exists(MEMORY_FILE):
+        return {"count": 0, "memories": {}}
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            memories = json.load(f)
+    except Exception as e:
+        return {"error": str(e)}
+
+    q = (query or "").lower().strip()
+    if not q:
+        return {"count": len(memories), "memories": memories}
+
+    q_tokens = set(re.findall(r"\w+", q))
+    scored = []
+    for k, v in memories.items():
+        text_full = f"{k} {v}".lower()
+        tokens_full = set(re.findall(r"\w+", text_full))
+        overlap = len(q_tokens & tokens_full)
+        if q in text_full or overlap > 0:
+            score = (10 if q in text_full else 0) + overlap * 3
+            scored.append((score, k, v))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = {k: v for _, k, v in scored[:15]}
+    return {"query": query, "count": len(results), "memories": results}
+
+
 def web_search(query: str, max_results: int = 5, **kwargs) -> dict:
     """Searches the live web via DuckDuckGo without API keys."""
     try:
@@ -649,6 +679,202 @@ def get_mix_archive_stats(**kwargs) -> dict:
     }
 
 
+def get_mix_tracklist(target: str, **kwargs) -> dict:
+    """Retrieves the full timestamped tracklist for a specific DJ mix from companion .txt, .cue, or Traktor .nml files."""
+    roots = get_mix_archive_roots()
+    if not roots:
+        return {"error": "No accessible Mix Archive found on host."}
+
+    target_clean = (target or "").strip()
+    if not target_clean:
+        return {"error": "Target mix name or path cannot be empty."}
+
+    # 1. If target is already a filepath to a tracklist file
+    if os.path.isfile(target_clean) and target_clean.lower().endswith((".txt", ".cue", ".nml")):
+        tracklist_file = target_clean
+    else:
+        # 2. Search for candidate companion files
+        candidates = []
+        target_stem = os.path.splitext(os.path.basename(target_clean))[0].lower()
+        target_words = [w for w in re.split(r"[\s_\-]+", target_stem) if len(w) > 2]
+
+        for root in roots:
+            for dirpath, _, filenames in os.walk(root):
+                for fname in filenames:
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext in (".txt", ".cue", ".nml"):
+                        fn_lower = fname.lower()
+                        if target_stem and target_stem in fn_lower:
+                            candidates.append((10, os.path.join(dirpath, fname)))
+                        elif target_words:
+                            matches = sum(1 for w in target_words if w in fn_lower)
+                            if matches >= max(1, len(target_words) - 1):
+                                candidates.append((matches, os.path.join(dirpath, fname)))
+
+        if not candidates:
+            return {"error": f"No companion tracklist (.txt, .cue, .nml) found matching '{target}' in mix archives."}
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        tracklist_file = candidates[0][1]
+
+    # Parse the tracklist file
+    parsed_tracks = []
+    ext = os.path.splitext(tracklist_file)[1].lower()
+
+    if ext == ".txt":
+        try:
+            with open(tracklist_file, "r", encoding="utf-8", errors="replace") as f:
+                in_tracklist = False
+                for line in f:
+                    sline = line.strip()
+                    if "TRACKLIST" in sline.upper():
+                        in_tracklist = True
+                        continue
+                    if not sline or sline.startswith("="):
+                        continue
+                    m = re.match(r"^(?:\[([0-9:]+)\]\s*)?(?:(\d+)[\.\)]\s*)?(.*?)\s*[-–—]\s*(.*)$", sline)
+                    if m:
+                        timestamp = m.group(1) or ""
+                        idx = int(m.group(2)) if m.group(2) else len(parsed_tracks) + 1
+                        artist = m.group(3).strip()
+                        title = m.group(4).strip()
+                        parsed_tracks.append({"index": idx, "time": timestamp, "artist": artist, "title": title, "raw": sline})
+                    elif in_tracklist:
+                        parsed_tracks.append({"index": len(parsed_tracks) + 1, "raw": sline})
+        except Exception as e:
+            return {"error": f"Error reading tracklist text: {e}"}
+
+    elif ext == ".cue":
+        try:
+            with open(tracklist_file, "r", encoding="utf-8", errors="replace") as f:
+                cur_track = {}
+                for line in f:
+                    sline = line.strip()
+                    if sline.startswith("TRACK"):
+                        if cur_track:
+                            parsed_tracks.append(cur_track)
+                        m_idx = re.search(r"TRACK\s+(\d+)", sline)
+                        cur_track = {"index": int(m_idx.group(1)) if m_idx else len(parsed_tracks) + 1, "time": "", "artist": "", "title": ""}
+                    elif sline.startswith("TITLE") and cur_track:
+                        cur_track["title"] = sline.split("TITLE", 1)[1].strip(' "')
+                    elif sline.startswith("PERFORMER") and cur_track:
+                        cur_track["artist"] = sline.split("PERFORMER", 1)[1].strip(' "')
+                    elif sline.startswith("INDEX 01") and cur_track:
+                        cur_track["time"] = sline.split("INDEX 01", 1)[1].strip()
+                if cur_track:
+                    parsed_tracks.append(cur_track)
+        except Exception as e:
+            return {"error": f"Error reading cue sheet: {e}"}
+
+    elif ext == ".nml":
+        try:
+            with open(tracklist_file, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            for m in re.finditer(r'<ENTRY[^>]+TITLE="([^"]*)"[^>]+ARTIST="([^"]*)"', content):
+                parsed_tracks.append({
+                    "index": len(parsed_tracks) + 1,
+                    "artist": m.group(2),
+                    "title": m.group(1),
+                    "raw": f"{m.group(2)} - {m.group(1)}",
+                })
+        except Exception as e:
+            return {"error": f"Error reading Traktor NML: {e}"}
+
+    return {
+        "mix_target": target,
+        "tracklist_file": tracklist_file,
+        "total_tracks": len(parsed_tracks),
+        "tracks": parsed_tracks[:50],
+    }
+
+
+def find_track_in_mixes(query: str, max_results: int = 15, **kwargs) -> dict:
+    """Searches across all DJ mix tracklists (.txt, .cue, Traktor history) for a specific song title, remix, or artist."""
+    roots = get_mix_archive_roots()
+    if not roots:
+        return {"error": "No accessible Mix Archive found on host."}
+
+    q = (query or "").lower().strip()
+    if not q:
+        return {"error": "Query cannot be empty."}
+
+    matches = []
+    limit = max(1, min(50, int(max_results)))
+
+    for root in roots:
+        if len(matches) >= limit:
+            break
+        for dirpath, _, filenames in os.walk(root):
+            if len(matches) >= limit:
+                break
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in (".txt", ".cue", ".nml"):
+                    continue
+                full_path = os.path.join(dirpath, fname)
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                        if ext == ".txt":
+                            first_chunk = f.read(1024)
+                            if "TRACKLIST" not in first_chunk.upper() and "ARTIST:" not in first_chunk.upper():
+                                continue
+                            f.seek(0)
+                            for line_idx, line in enumerate(f, 1):
+                                if q in line.lower() and not line.startswith("="):
+                                    matches.append({
+                                        "mix": os.path.splitext(fname)[0],
+                                        "source_type": "companion_txt",
+                                        "track": line.strip(),
+                                        "file": full_path,
+                                    })
+                                    if len(matches) >= limit:
+                                        break
+                        elif ext == ".cue":
+                            f.seek(0)
+                            content = f.read()
+                            if q in content.lower():
+                                for track_block in content.split("TRACK "):
+                                    if q in track_block.lower():
+                                        t_title = re.search(r'TITLE\s+"([^"]*)"', track_block)
+                                        t_artist = re.search(r'PERFORMER\s+"([^"]*)"', track_block)
+                                        t_idx = re.search(r"^(\d+)", track_block.strip())
+                                        artist_str = t_artist.group(1) if t_artist else "Unknown"
+                                        title_str = t_title.group(1) if t_title else "Unknown"
+                                        idx_str = t_idx.group(1) if t_idx else "?"
+                                        matches.append({
+                                            "mix": os.path.splitext(fname)[0],
+                                            "source_type": "cue_sheet",
+                                            "track": f"{idx_str}. {artist_str} - {title_str}",
+                                            "file": full_path,
+                                        })
+                                        if len(matches) >= limit:
+                                            break
+                        elif ext == ".nml":
+                            content = f.read()
+                            if q in content.lower():
+                                for m in re.finditer(r'<ENTRY[^>]+TITLE="([^"]*)"[^>]+ARTIST="([^"]*)"', content):
+                                    t_title = m.group(1)
+                                    t_artist = m.group(2)
+                                    combined = f"{t_artist} - {t_title}"
+                                    if q in combined.lower():
+                                        matches.append({
+                                            "mix": os.path.splitext(fname)[0],
+                                            "source_type": "traktor_history",
+                                            "track": combined,
+                                            "file": full_path,
+                                        })
+                                        if len(matches) >= limit:
+                                            break
+                except Exception:
+                    continue
+
+    return {
+        "query": query,
+        "match_count": len(matches),
+        "matches": matches,
+    }
+
+
 def system_audio_volume(action: str = "status", level: int = None, **kwargs) -> dict:
     """Controls or inspects host audio volume via PipeWire / WirePlumber (wpctl)."""
     act = (action or "status").lower().strip()
@@ -788,6 +1014,70 @@ def notify_audio_saved(audio_path: str, text_path: str):
             pass
 
 
+_AUDIO_PHRASE_CACHE = {}
+
+
+def synthesize_piper_wav_bytes(text: str, voice_name: str = None, speed: float = 1.0) -> bytes:
+    """Synthesizes speech to in-memory WAV audio bytes with voice selection, speed scaling, and LRU phrase caching."""
+    clean_text = clean_speech_text(text) or text.strip()
+    if not clean_text:
+        return b""
+
+    spd = max(0.4, min(2.5, float(speed)))
+    cache_key = (clean_text, voice_name or "default", round(spd, 2))
+    if cache_key in _AUDIO_PHRASE_CACHE:
+        return _AUDIO_PHRASE_CACHE[cache_key]
+
+    voice = get_cached_piper_voice()
+    buf = io.BytesIO()
+    if voice:
+        try:
+            from piper.config import SynthesisConfig
+            syn_cfg = SynthesisConfig(length_scale=1.0 / spd) if spd != 1.0 else None
+            with wave.open(buf, "wb") as wf:
+                voice.synthesize_wav(clean_text, wf, syn_config=syn_cfg)
+            raw = buf.getvalue()
+            if raw:
+                if len(clean_text) < 140 and len(_AUDIO_PHRASE_CACHE) < 200:
+                    _AUDIO_PHRASE_CACHE[cache_key] = raw
+                return raw
+        except Exception as e:
+            print(f"\033[1;33m[TTS Python Synthesis Error]\033[0m {e}")
+
+    # Fallback to piper CLI
+    piper_bin = shutil.which("piper") or os.path.expanduser("~/.local/bin/piper")
+    voice_path = get_piper_voice_path()
+    if voice_path and os.path.exists(piper_bin):
+        try:
+            length_scale = str(round(1.0 / spd, 2))
+            cmd = [piper_bin, "-m", voice_path, "--length-scale", length_scale, "--output_file", "-"]
+            p = subprocess.run(cmd, input=clean_text.encode("utf-8"), capture_output=True, timeout=15)
+            if p.returncode == 0 and p.stdout:
+                if len(clean_text) < 140 and len(_AUDIO_PHRASE_CACHE) < 200:
+                    _AUDIO_PHRASE_CACHE[cache_key] = p.stdout
+                return p.stdout
+        except Exception as e:
+            print(f"\033[1;33m[TTS CLI Fallback Error]\033[0m {e}")
+
+    # Fallback to espeak-ng
+    if shutil.which("espeak-ng"):
+        try:
+            temp_wav = f"/tmp/espeak_{uuid.uuid4().hex[:6]}.wav"
+            subprocess.run(["espeak-ng", "-w", temp_wav, clean_text], timeout=15, check=True, capture_output=True)
+            if os.path.exists(temp_wav):
+                with open(temp_wav, "rb") as tf:
+                    raw = tf.read()
+                try:
+                    os.remove(temp_wav)
+                except Exception:
+                    pass
+                return raw
+        except Exception as e:
+            print(f"\033[1;33m[espeak-ng Fallback Error]\033[0m {e}")
+
+    return b""
+
+
 def save_speech_response(text: str, filename_prefix: str = "agent_speech", **kwargs) -> dict:
     """
     Synthesizes and saves the agent's speech response to an audio file (.wav) and a companion
@@ -811,53 +1101,22 @@ def save_speech_response(text: str, filename_prefix: str = "agent_speech", **kwa
         return {"error": f"Failed to write text transcript: {e}"}
 
     # 2. Synthesize audio
-    speech_text = clean_speech_text(text)
-    if not speech_text:
-        speech_text = text.strip()
-
-    audio_saved = False
-    voice = get_cached_piper_voice()
-    if voice:
+    speech_text = clean_speech_text(text) or text.strip()
+    wav_bytes = synthesize_piper_wav_bytes(speech_text)
+    if wav_bytes:
         try:
-            with wave.open(audio_path, "wb") as wf:
-                voice.synthesize_wav(speech_text, wf)
-            audio_saved = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+            with open(audio_path, "wb") as wf:
+                wf.write(wav_bytes)
+            notify_audio_saved(audio_path, text_path)
+            return {
+                "status": "saved",
+                "audio_path": audio_path,
+                "text_path": text_path,
+                "size_bytes": len(wav_bytes),
+                "text": text.strip(),
+            }
         except Exception as e:
-            print(f"\033[1;33m[TTS Synthesis Error]\033[0m {e}")
-
-    # Fallback to piper CLI
-    if not audio_saved:
-        piper_bin = shutil.which("piper") or os.path.expanduser("~/.local/bin/piper")
-        voice_path = get_piper_voice_path()
-        if voice_path and os.path.exists(piper_bin):
-            try:
-                subprocess.run(
-                    [piper_bin, "-m", voice_path, "-f", audio_path],
-                    input=speech_text,
-                    text=True,
-                    timeout=30,
-                    check=True,
-                    capture_output=True,
-                )
-                audio_saved = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
-            except Exception as e:
-                print(f"\033[1;33m[Piper CLI Error]\033[0m {e}")
-
-    # Fallback to espeak-ng
-    if not audio_saved and shutil.which("espeak-ng"):
-        try:
-            subprocess.run(
-                ["espeak-ng", "-w", audio_path, speech_text],
-                timeout=30,
-                check=True,
-                capture_output=True,
-            )
-            audio_saved = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
-        except Exception as e:
-            print(f"\033[1;33m[espeak-ng Error]\033[0m {e}")
-
-    if audio_saved:
-        notify_audio_saved(audio_path, text_path)
+            print(f"\033[1;33m[Audio Write Error]\033[0m {e}")
         return {
             "status": "saved",
             "audio_path": audio_path,
@@ -921,9 +1180,12 @@ AVAILABLE_TOOLS = {
     "web_search": web_search,
     "save_speech_response": save_speech_response,
     "search_mix_archive": search_mix_archive,
+    "get_mix_tracklist": get_mix_tracklist,
+    "find_track_in_mixes": find_track_in_mixes,
     "play_mix_or_audio": play_mix_or_audio,
     "get_mix_archive_stats": get_mix_archive_stats,
     "system_audio_volume": system_audio_volume,
+    "search_agent_memories": search_agent_memories,
 }
 
 
@@ -984,13 +1246,13 @@ def dispatch_tool(func_name: str, kwargs: dict) -> dict:
                 break
 
     if "query" not in kwargs:
-        for alias in ("search", "q", "term", "mix_query"):
+        for alias in ("search", "q", "term", "mix_query", "track_query", "song", "artist"):
             if alias in kwargs:
                 kwargs["query"] = kwargs[alias]
                 break
 
     if "target" not in kwargs:
-        for alias in ("mix", "track", "audio", "file", "filename"):
+        for alias in ("mix", "track", "audio", "file", "filename", "mix_target"):
             if alias in kwargs:
                 kwargs["target"] = kwargs[alias]
                 break
@@ -1027,11 +1289,14 @@ tool_schemas = [
     ToolDescription(name="set_agent_memory", description="Saves a key-value fact to persistent storage.", parameters={"type": "object", "properties": {"key": {"type": "string"}, "value": {"type": "string"}}, "required": ["key", "value"]}),
     ToolDescription(name="get_agent_memory", description="Retrieves a persistent key-value fact.", parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}),
     ToolDescription(name="list_agent_memories", description="Lists all persistent key-value facts.", parameters={"type": "object", "properties": {}}),
+    ToolDescription(name="search_agent_memories", description="Searches persistent key-value facts using multi-term keyword overlap and ranking.", parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}),
     ToolDescription(name="web_search", description="Live web search via DuckDuckGo.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
     ToolDescription(name="list_directory", description="Lists directory contents with file types, sizes in KB, and modified dates.", parameters={"type": "object", "properties": {"path": {"type": "string"}, "show_hidden": {"type": "boolean"}, "max_items": {"type": "integer"}}, "required": ["path"]}),
     ToolDescription(name="stop_background_task", description="Terminates a running background task process by its job_id.", parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ToolDescription(name="save_speech_response", description="Synthesizes and saves the agent's speech response to an audio file (.wav) and companion transcript (.txt) in the archive directory.", parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
     ToolDescription(name="search_mix_archive", description="Searches user's Mix Archive for audio mixes, companion tracklists, and spectrograms.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
+    ToolDescription(name="get_mix_tracklist", description="Retrieves timestamped tracklist for a DJ mix from companion .txt, .cue, or Traktor .nml files.", parameters={"type": "object", "properties": {"target": {"type": "string"}}, "required": ["target"]}),
+    ToolDescription(name="find_track_in_mixes", description="Searches across all DJ mix tracklists (.txt, .cue, Traktor history) for a specific song title, remix, or artist.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
     ToolDescription(name="play_mix_or_audio", description="Controls DJ playback or plays an audio mix (using MP Audio Player). Commands: 'play', 'pause', 'toggle', 'stop', 'latest', 'status'. Target: filepath, keyword, or 'latest'.", parameters={"type": "object", "properties": {"target": {"type": "string"}, "command": {"type": "string"}}, "required": []}),
     ToolDescription(name="get_mix_archive_stats", description="Returns statistics about the user's Mix Archive (counts by format, total GB, and latest 3 mixes).", parameters={"type": "object", "properties": {}}),
     ToolDescription(name="system_audio_volume", description="Inspects or controls host audio volume via PipeWire / WirePlumber. Actions: 'status', 'set' (with level 0-100), 'toggle_mute'.", parameters={"type": "object", "properties": {"action": {"type": "string"}, "level": {"type": "integer"}}, "required": ["action"]}),
@@ -1159,32 +1424,17 @@ def extract_content_text(msg) -> str:
 def init_agent():
     enc = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     sys_content = SystemContent.new()
-    
-    memory_summary = ""
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r") as f:
-                mem_data = json.load(f)
-                if mem_data:
-                    memory_summary = " Persistent Environment Memories: " + json.dumps(mem_data)
-        except Exception:
-            pass
 
     dev_content = (
         DeveloperContent.new()
         .with_instructions(
-            "You are an autonomous local system administration, scripting, technical research, and DJ Mix Studio assistant. "
-            "When modifying files, running commands, monitoring hardware, managing long background tasks, or managing music/mixes, "
-            "YOU MUST ALWAYS INVOKE YOUR PROVIDED TOOLS. "
-            "For inspecting directory contents, use `list_directory`. "
-            "For large files (>300 lines), NEVER read them entirely: use `search_file_regex` or `read_file_lines`. "
-            "For multi-file modifications, use `git_checkpoint`. "
-            "For long background jobs, use `start_background_task`, `check_background_task`, or `stop_background_task`. "
-            "You have dedicated tools for the user's Mix Archive and DJ studio: `search_mix_archive` to find mixes and tracklists, "
-            "`play_mix_or_audio` to start/pause/stop playback via MP Audio Player, `get_mix_archive_stats` for storage and mix counts, "
-            "and `system_audio_volume` for audio volume and muting. "
-            "When replying via voice in the final channel, speak naturally and conversationally. Avoid bulleted lists, markdown symbols, and code blocks."
-            + memory_summary
+            "You are an autonomous engineering, local administration, and DJ Mix Studio AI assistant. "
+            "Invoke your tools to inspect files, execute bash commands, monitor telemetry, manage jobs, or control music. "
+            "Tools include: `list_directory` for directory contents, `read_file_lines`/`search_file_regex` for files, "
+            "`start_background_task`/`stop_background_task` for background jobs, `git_checkpoint` for git repositories, "
+            "`search_agent_memories`/`set_agent_memory` for persistent facts, "
+            "`search_mix_archive`, `get_mix_tracklist`, `find_track_in_mixes`, `play_mix_or_audio`, `system_audio_volume` for music studio operations. "
+            "When speaking via voice in the final channel, reply conversationally without raw markdown syntax."
         )
         .with_function_tools(tool_schemas)
     )
@@ -1197,12 +1447,410 @@ def init_agent():
 
 
 # ---------------------------------------------------------------------------
-# 4. Voice Bridge Server with Real-Time SSE Forwarding & Socket Safety
 # ---------------------------------------------------------------------------
+# 4. Web HUD Dashboard & OpenAI Bridge Server
+# ---------------------------------------------------------------------------
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MP Harmony AI Agent • Engineering & Music Hub</title>
+<style>
+  :root {
+    --bg: #090d16;
+    --card: #111827;
+    --card-border: #1f293d;
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --green: #10b981;
+    --magenta: #d946ef;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding: 24px;
+    line-height: 1.5;
+  }
+  .container { max-width: 1280px; margin: 0 auto; }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--card-border);
+    margin-bottom: 24px;
+  }
+  .title-group { display: flex; align-items: center; gap: 14px; }
+  .logo {
+    width: 42px; height: 42px; background: linear-gradient(135deg, var(--accent), var(--magenta));
+    border-radius: 10px; display: flex; align-items: center; justify-content: center;
+    font-weight: 900; font-size: 20px; color: #fff; box-shadow: 0 0 16px rgba(56, 189, 248, 0.4);
+  }
+  h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; }
+  .badge {
+    font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 9999px;
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .badge-online { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
+  .badge-model { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3); }
+  .badge-port { background: rgba(217, 70, 239, 0.15); color: var(--magenta); border: 1px solid rgba(217, 70, 239, 0.3); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 20px; margin-bottom: 24px; }
+  .card {
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+  }
+  .card h2 { font-size: 15px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+  .telemetry-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 14px; }
+  .telemetry-row:last-child { border-bottom: none; }
+  .val { font-weight: 600; color: #fff; font-family: monospace; }
+
+  /* Audio player card */
+  .audio-item {
+    background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border);
+    border-radius: 8px; padding: 12px; margin-bottom: 12px;
+  }
+  .audio-header { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .audio-transcript { font-size: 13px; color: var(--text); margin-bottom: 8px; font-style: italic; }
+  audio { width: 100%; height: 32px; outline: none; }
+
+  /* Chat Sandbox */
+  .chat-box {
+    display: flex; flex-direction: column; height: 460px;
+  }
+  .chat-output {
+    flex: 1; background: #06090e; border: 1px solid var(--card-border); border-radius: 8px;
+    padding: 14px; overflow-y: auto; font-size: 14px; font-family: monospace; line-height: 1.6;
+    white-space: pre-wrap; word-break: break-word; color: #e2e8f0; margin-bottom: 12px;
+  }
+  .input-bar { display: flex; gap: 8px; }
+  textarea {
+    flex: 1; background: #06090e; border: 1px solid var(--card-border); border-radius: 8px;
+    color: #fff; padding: 10px 14px; font-size: 14px; font-family: inherit; resize: none; height: 50px; outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #000; border: none; font-weight: 600; border-radius: 8px;
+    padding: 0 18px; cursor: pointer; transition: opacity 0.15s; font-size: 14px;
+  }
+  button:hover { opacity: 0.9; }
+  button.btn-speak { background: var(--magenta); color: #fff; margin-left: 6px; }
+  button.btn-stop { background: var(--red); color: #fff; }
+  .actions { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .quick-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .chip { background: rgba(56, 189, 248, 0.1); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.2); padding: 3px 8px; border-radius: 6px; font-size: 11px; cursor: pointer; }
+  .chip:hover { background: rgba(56, 189, 248, 0.2); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="title-group">
+      <div class="logo">H</div>
+      <div>
+        <h1>MP Harmony AI Agent</h1>
+        <p style="font-size: 13px; color: var(--muted);">Autonomous Engineering & DJ Studio Engine</p>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge badge-online">● ONLINE</span>
+      <span class="badge badge-port">PORT: 11435</span>
+      <span class="badge badge-model" id="model-badge">MODEL: gpt-oss-pinned</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- Telemetry Card -->
+    <div class="card">
+      <h2>Host & Hardware Telemetry <span id="refresh-indicator" style="font-size: 11px; color: var(--accent);">● LIVE</span></h2>
+      <div class="telemetry-row"><span>Load Average (1, 5, 15m)</span><span class="val" id="val-load">--</span></div>
+      <div class="telemetry-row"><span>Host Memory (RAM)</span><span class="val" id="val-mem">--</span></div>
+      <div class="telemetry-row"><span>GPU Hardware</span><span class="val" id="val-gpu-model">--</span></div>
+      <div class="telemetry-row"><span>GPU VRAM</span><span class="val" id="val-gpu-vram">--</span></div>
+      <div class="telemetry-row"><span>GPU Utilization</span><span class="val" id="val-gpu-util">--</span></div>
+      <div class="telemetry-row"><span>GPU Temperature</span><span class="val" id="val-gpu-temp">--</span></div>
+      <div class="telemetry-row"><span>Audio Sink Volume</span><span class="val" id="val-audio-vol">--</span></div>
+    </div>
+
+    <!-- DJ Mix Studio Card -->
+    <div class="card">
+      <h2>DJ Mix Archive Status</h2>
+      <div class="telemetry-row"><span>Archive Roots</span><span class="val" id="val-mix-roots">--</span></div>
+      <div class="telemetry-row"><span>Total Audio Files</span><span class="val" id="val-mix-total">--</span></div>
+      <div class="telemetry-row"><span>Total Storage</span><span class="val" id="val-mix-gb">--</span></div>
+      <div class="telemetry-row"><span>Formats</span><span class="val" id="val-mix-formats">--</span></div>
+      <div style="margin-top: 14px; font-size: 13px; font-weight: 600; color: var(--muted);">Latest Mixes:</div>
+      <div id="latest-mixes-list" style="margin-top: 6px; font-size: 12px; color: var(--text);"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- Chat Sandbox Card -->
+    <div class="card" style="grid-column: span 1;">
+      <h2>Interactive Chat & Voice Sandbox</h2>
+      <div class="chat-box">
+        <div class="chat-output" id="chat-output">Ready. Type a prompt or click a quick suggestion below...</div>
+        <div class="input-bar">
+          <textarea id="prompt-input" placeholder="Ask MP Harmony Agent anything (e.g. check tracklist, audio volume, telemetry)..."></textarea>
+          <button id="send-btn" onclick="sendChat()">Send</button>
+          <button id="abort-btn" class="btn-stop" style="display:none;" onclick="abortChat()">Abort</button>
+        </div>
+        <div class="actions">
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="checkbox" id="stream-toggle" checked> Stream Response (SSE)
+          </label>
+          <button class="btn-speak" id="speak-btn" style="padding:4px 12px; font-size:12px;" onclick="speakResponse()">🔊 Speak</button>
+        </div>
+        <div class="quick-chips">
+          <span class="chip" onclick="quickPrompt('What is the current system audio volume? Use your tool.')">Audio Volume</span>
+          <span class="chip" onclick="quickPrompt('Get mix archive stats')">Mix Archive Stats</span>
+          <span class="chip" onclick="quickPrompt('Find track in mixes for Dreamy')">Find 'Dreamy' Tracks</span>
+          <span class="chip" onclick="quickPrompt('Get system telemetry')">Telemetry</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recent Speech Card -->
+    <div class="card" style="grid-column: span 1;">
+      <h2>Audio Speech Archive <button style="background:transparent; color:var(--accent); font-size:12px; padding:0;" onclick="loadRecentAudio()">↻ Refresh</button></h2>
+      <div id="recent-audio-container" style="max-height: 420px; overflow-y: auto;">
+        <p style="color:var(--muted); font-size:13px;">Loading recent voice responses...</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let lastAssistantReply = "";
+  let activeAbortController = null;
+
+  async function fetchTelemetry() {
+    try {
+      const res = await fetch('/api/telemetry');
+      const data = await res.json();
+      if (data.load_avg_1_5_15m) {
+        document.getElementById('val-load').textContent = data.load_avg_1_5_15m.join(', ');
+      }
+      if (data.memory && data.memory[1]) {
+        document.getElementById('val-mem').textContent = data.memory[1].replace(/\\s+/g, ' ');
+      }
+      if (data.gpu) {
+        document.getElementById('val-gpu-model').textContent = data.gpu.model || '--';
+        document.getElementById('val-gpu-vram').textContent = (data.gpu.vram_used || '') + ' / ' + (data.gpu.vram_total || '');
+        document.getElementById('val-gpu-util').textContent = data.gpu.utilization || '--';
+        document.getElementById('val-gpu-temp').textContent = data.gpu.temp || '--';
+      }
+    } catch(e){}
+  }
+
+  async function fetchMixStats() {
+    try {
+      const res = await fetch('/api/mix_stats');
+      const data = await res.json();
+      if (data.archive_roots) {
+        document.getElementById('val-mix-roots').textContent = data.archive_roots.length + ' configured root(s)';
+      }
+      if (data.total_audio_files) {
+        document.getElementById('val-mix-total').textContent = data.total_audio_files.toLocaleString() + ' files';
+      }
+      if (data.total_storage_gb) {
+        document.getElementById('val-mix-gb').textContent = data.total_storage_gb + ' GB';
+      }
+      if (data.formats) {
+        document.getElementById('val-mix-formats').textContent = Object.entries(data.formats).map(([k,v]) => k.toUpperCase() + ':' + v).join(' | ');
+      }
+      if (data.latest_mixes && data.latest_mixes.length) {
+        document.getElementById('latest-mixes-list').innerHTML = data.latest_mixes.map(m =>
+          '<div style="padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);"><b>' + m.title + '</b> (' + m.size_mb + ' MB) <span style="color:var(--muted);">' + m.date + '</span></div>'
+        ).join('');
+      }
+    } catch(e){}
+  }
+
+  async function loadRecentAudio() {
+    const container = document.getElementById('recent-audio-container');
+    try {
+      const res = await fetch('/api/recent_audio');
+      const data = await res.json();
+      if (!data.audio_responses || !data.audio_responses.length) {
+        container.innerHTML = '<p style="color:var(--muted); font-size:13px;">No recorded audio files found.</p>';
+        return;
+      }
+      container.innerHTML = data.audio_responses.map(item => `
+        <div class="audio-item">
+          <div class="audio-header">
+            <span>${item.filename}</span>
+            <span>${item.mtime}</span>
+          </div>
+          <div class="audio-transcript">${item.transcript ? '"' + item.transcript + '"' : '(No transcript)'}</div>
+          <audio controls preload="none" src="/audio/${item.filename}"></audio>
+        </div>
+      `).join('');
+    } catch(e) {
+      container.innerHTML = '<p style="color:var(--red); font-size:13px;">Error loading audio archive.</p>';
+    }
+  }
+
+  function quickPrompt(text) {
+    document.getElementById('prompt-input').value = text;
+    sendChat();
+  }
+
+  async function sendChat() {
+    const input = document.getElementById('prompt-input');
+    const text = input.value.trim();
+    if (!text) return;
+
+    const out = document.getElementById('chat-output');
+    out.textContent = "Agent thinking & generating...\\n";
+    lastAssistantReply = "";
+
+    const stream = document.getElementById('stream-toggle').checked;
+    document.getElementById('send-btn').style.display = 'none';
+    document.getElementById('abort-btn').style.display = 'inline-block';
+
+    activeAbortController = new AbortController();
+
+    try {
+      const resp = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Session-Id': 'web-hud' },
+        body: JSON.stringify({
+          model: 'gpt-oss-pinned:latest',
+          messages: [{ role: 'user', content: text }],
+          stream: stream
+        }),
+        signal: activeAbortController.signal
+      });
+
+      if (stream) {
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        out.textContent = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+              try {
+                const parsed = JSON.parse(line.substring(6));
+                const delta = parsed.choices?.[0]?.delta?.content || "";
+                out.textContent += delta;
+                lastAssistantReply += delta;
+                out.scrollTop = out.scrollHeight;
+              } catch(e){}
+            }
+          }
+        }
+      } else {
+        const data = await resp.json();
+        const content = data.choices?.[0]?.message?.content || JSON.stringify(data, null, 2);
+        out.textContent = content;
+        lastAssistantReply = content;
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        out.textContent += "\\n[Error: " + e.message + "]";
+      } else {
+        out.textContent += "\\n[Interrupted by user]";
+      }
+    } finally {
+      document.getElementById('send-btn').style.display = 'inline-block';
+      document.getElementById('abort-btn').style.display = 'none';
+      loadRecentAudio();
+    }
+  }
+
+  async function abortChat() {
+    if (activeAbortController) activeAbortController.abort();
+    fetch('/v1/abort', { method: 'POST' });
+  }
+
+  async function speakResponse() {
+    if (!lastAssistantReply) return;
+    try {
+      const res = await fetch('/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: lastAssistantReply, voice: 'amy', speed: 1.0 })
+      });
+      const blob = await res.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+      audio.play();
+    } catch(e) {
+      alert("TTS Error: " + e);
+    }
+  }
+
+  document.getElementById('prompt-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChat();
+    }
+  });
+
+  fetchTelemetry();
+  fetchMixStats();
+  loadRecentAudio();
+  setInterval(fetchTelemetry, 5000);
+</script>
+</body>
+</html>
+"""
+
 GLOBAL_STATE = {
-    "lock": threading.Lock(),
+    "sessions": {},  # session_id -> {"convo": Conversation, "last_used": float, "lock": threading.Lock()}
+    "global_lock": threading.Lock(),
     "abort_event": threading.Event(),
+    "model_name": "gpt-oss-pinned:latest",
+    "enc": None,
+    "convo": None,
 }
+
+
+def get_session_data(session_id: str, incoming_messages: list = None) -> dict:
+    """Retrieves or creates an isolated conversation session with multi-turn history reconciliation."""
+    with GLOBAL_STATE["global_lock"]:
+        now = time.time()
+        # Evict inactive sessions (>24 hours)
+        stale = [s for s, data in GLOBAL_STATE["sessions"].items() if now - data.get("last_used", 0) > 86400]
+        for s in stale:
+            del GLOBAL_STATE["sessions"][s]
+
+        if session_id not in GLOBAL_STATE["sessions"]:
+            _, new_convo = init_agent()
+            GLOBAL_STATE["sessions"][session_id] = {
+                "convo": new_convo,
+                "last_used": now,
+                "lock": threading.Lock(),
+            }
+
+        sess = GLOBAL_STATE["sessions"][session_id]
+        sess["last_used"] = now
+        convo = sess["convo"]
+
+        # Reconcile if client started a fresh chat thread with 1 message
+        if incoming_messages and len(incoming_messages) == 1 and incoming_messages[0].get("role") == "user":
+            user_turn_count = len([m for m in convo.messages if getattr(m, "role", None) == Role.USER])
+            if user_turn_count > 1:
+                _, fresh_convo = init_agent()
+                sess["convo"] = fresh_convo
+
+        return sess
+
 
 class HarmonyBridgeHandler(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -1216,7 +1864,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
         """Injects cross-origin resource sharing headers for Open WebUI & web harnesses."""
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, X-Session-Id, X-Conversation-Id")
         self.send_header("Access-Control-Max-Age", "86400")
 
     def do_OPTIONS(self):
@@ -1227,12 +1875,89 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        """Handles OpenAI model discovery (/v1/models) and liveness health checks."""
+        """Handles OpenAI model discovery, Web HUD dashboard, static audio serving, and health checks."""
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path.rstrip("/")
         if not path:
             path = "/"
 
+        # 1. Static Audio File Serving: /audio/<filename>
+        if path.startswith("/audio/"):
+            fname = os.path.basename(path.split("/audio/", 1)[1])
+            fpath = os.path.join(AUDIO_OUTPUT_DIR, fname)
+            if os.path.isfile(fpath) and os.path.exists(fpath):
+                content_type = "audio/wav" if fname.endswith(".wav") else "text/plain"
+                try:
+                    with open(fpath, "rb") as f:
+                        data_bytes = f.read()
+                    self.send_response(200)
+                    self.send_cors_headers()
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data_bytes)))
+                    self.end_headers()
+                    self.wfile.write(data_bytes)
+                    return
+                except Exception:
+                    pass
+            self.send_response(404)
+            self.send_cors_headers()
+            self.end_headers()
+            return
+
+        # 2. Telemetry API: /api/telemetry
+        if path == "/api/telemetry":
+            body = json.dumps(get_system_telemetry()).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 3. Recent Audio Responses API: /api/recent_audio
+        if path == "/api/recent_audio":
+            recent = []
+            if os.path.exists(AUDIO_OUTPUT_DIR):
+                wavs = [f for f in os.listdir(AUDIO_OUTPUT_DIR) if f.endswith(".wav")]
+                wavs.sort(key=lambda x: os.path.getmtime(os.path.join(AUDIO_OUTPUT_DIR, x)), reverse=True)
+                for w in wavs[:10]:
+                    full_w = os.path.join(AUDIO_OUTPUT_DIR, w)
+                    txt_w = full_w[:-4] + ".txt"
+                    transcript = ""
+                    if os.path.exists(txt_w):
+                        try:
+                            with open(txt_w, "r", encoding="utf-8", errors="replace") as tf:
+                                transcript = tf.read().strip()
+                        except Exception:
+                            pass
+                    recent.append({
+                        "filename": w,
+                        "size_bytes": os.path.getsize(full_w),
+                        "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(full_w))),
+                        "transcript": transcript[:200] + ("..." if len(transcript) > 200 else ""),
+                    })
+            body = json.dumps({"audio_responses": recent}).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 4. Mix Stats API: /api/mix_stats
+        if path == "/api/mix_stats":
+            body = json.dumps(get_mix_archive_stats()).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 5. OpenAI Model Discovery: /v1/models
         if path in ("/v1/models", "/models"):
             model_name = GLOBAL_STATE.get("model_name", "gpt-oss-pinned:latest")
             models_data = [
@@ -1269,7 +1994,8 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        if path in ("/", "/health", "/status"):
+        # 6. Raw Status JSON: /status, /health
+        if path in ("/health", "/status"):
             model_name = GLOBAL_STATE.get("model_name", "gpt-oss-pinned:latest")
             resp = {
                 "status": "online",
@@ -1277,11 +2003,42 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                 "model": model_name,
                 "port": AGENT_PORT,
                 "tools_count": len(AVAILABLE_TOOLS),
+                "active_sessions": len(GLOBAL_STATE.get("sessions", {})),
             }
             body = json.dumps(resp, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_cors_headers()
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 7. Web HUD & Diagnostic Dashboard: / or /dashboard or /hud
+        if path in ("/", "/dashboard", "/hud"):
+            accept = self.headers.get("Accept", "")
+            if "application/json" in accept and "text/html" not in accept:
+                model_name = GLOBAL_STATE.get("model_name", "gpt-oss-pinned:latest")
+                resp = {
+                    "status": "online",
+                    "agent": "MP Harmony AI Agent",
+                    "model": model_name,
+                    "port": AGENT_PORT,
+                    "tools_count": len(AVAILABLE_TOOLS),
+                }
+                body = json.dumps(resp, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            body = DASHBOARD_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -1346,6 +2103,36 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             print("\033[1;31m[Barge-In]\033[0m Abort signal triggered via /v1/abort.")
             return
 
+        # 2. OpenAI Speech Endpoint: /v1/audio/speech
+        if path == "/v1/audio/speech":
+            content_length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length > 0 else {}
+            input_text = data.get("input", "")
+            voice_param = data.get("voice", "amy")
+            speed_param = float(data.get("speed", 1.0))
+
+            wav_bytes = synthesize_piper_wav_bytes(input_text, voice_name=voice_param, speed=speed_param)
+            if not wav_bytes:
+                self.send_response(500)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                body = b'{"error":"TTS synthesis failed"}'
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except Exception:
+                    pass
+                return
+
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav_bytes)))
+            self.end_headers()
+            self.wfile.write(wav_bytes)
+            return
+
         if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_response(404)
             self.send_cors_headers()
@@ -1385,17 +2172,27 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                 pass
             return
 
-        print(f"\n\033[1;35m[Input Received]\033[0m {last_user_msg} (stream={is_stream})")
+        # Resolve isolated session
+        session_id = (
+            self.headers.get("X-Session-Id")
+            or self.headers.get("X-Conversation-Id")
+            or data.get("user")
+            or "default"
+        )
+        sess = get_session_data(session_id, messages)
+        convo = sess["convo"]
+        sess_lock = sess["lock"]
+
+        print(f"\n\033[1;35m[Input Received]\033[0m [Session: {session_id}] {last_user_msg} (stream={is_stream})")
 
         enc = GLOBAL_STATE["enc"]
-        convo = GLOBAL_STATE["convo"]
         model_name = GLOBAL_STATE["model_name"]
 
         # Voice session reset trigger
         if last_user_msg.lower() in ("/reset", "reset", "clear session", "reset context"):
-            with GLOBAL_STATE["lock"]:
+            with sess_lock:
                 new_enc, new_convo = init_agent()
-                GLOBAL_STATE["convo"] = new_convo
+                sess["convo"] = new_convo
             if is_stream:
                 self.send_response(200)
                 self.send_cors_headers()
@@ -1453,7 +2250,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             heartbeat_thread.start()
 
         try:
-            with GLOBAL_STATE["lock"]:
+            with sess_lock:
                 prune_conversation_if_needed(convo, enc)
                 convo.messages.append(Message.from_role_and_content(Role.USER, last_user_msg))
 
