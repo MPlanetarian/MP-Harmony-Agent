@@ -1,4 +1,4 @@
-# Harmony Agent (`HA.py`)
+# Harmony Agent (`MP_Harmony_Agent.py`)
 
 A local autonomous system administration, scripting, and research agent powered by the **OpenAI Harmony** specification and **Ollama**. `HA.py` bridges low-level OS management (file inspection, code patching, regex search, live web search, and shell execution) with hands-free voice control via `local-voice-talk`.
 
@@ -13,6 +13,7 @@ A local autonomous system administration, scripting, and research agent powered 
 - **Safe Mode Guardrails:** Built-in pattern inspection blocks destructive operations (`rm -rf`, `mkfs`, `dd if=`, `shutdown`, `reboot`, `git reset --hard`) from executing through voice or shell tools.
 - **Voice & CLI Session Reset:** Say *"clear session"*, *"reset context"*, or type `/reset` to purge conversational history back to baseline without terminating the server.
 - **Large Script Navigation:** Employs windowed reads (`read_file_lines`) and targeted regex search (`search_file_regex`) to inspect multi-thousand-line scripts without blowing out context.
+- **Automatic Audio Speech Archiving:** Automatically synthesizes and records every assistant voice speech response into an archived `.wav` audio file alongside a matching `.txt` transcript file in `audio_responses/` for review and archiving, issuing instant terminal and desktop (`notify-send`) notifications.
 
 ---
 
@@ -20,6 +21,7 @@ A local autonomous system administration, scripting, and research agent powered 
 
 | Tool | Purpose | Safeguards & Behavior |
 | :--- | :--- | :--- |
+| `save_speech_response` | Synthesizes and saves audio speech (.wav) and text transcript (.txt). | Auto-detects local Piper ONNX voices; notifies desktop and console. |
 | `web_search` | Searches the live web for syntax, documentation, releases, and facts. | Zero API keys required; returns clean snippets and URLs. |
 | `search_file_regex` | Locates subroutines, variables, and keywords in massive files. | Returns line numbers and 1-line context snippets; capped results. |
 | `read_file_lines` | Reads targeted line ranges with 1-based line numbers. | Capped at 250 lines per step; protects context limits. |

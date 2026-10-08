@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.bak
+audio_responses/*
+!audio_responses/.gitkeep

@@ -10,6 +10,7 @@ import uuid
 import readline
 import threading
 import inspect
+import wave
 import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from openai_harmony import (
@@ -36,6 +37,11 @@ SAFE_MODE = True
 MEMORY_FILE = os.path.expanduser("~/.harmony_memory.json")
 JOBS_DIR = "/tmp/ha_jobs"
 os.makedirs(JOBS_DIR, exist_ok=True)
+AUDIO_OUTPUT_DIR = os.path.expanduser(
+    os.getenv("HARMONY_AUDIO_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_responses"))
+)
+AUDIO_AUTO_ARCHIVE = os.getenv("HARMONY_AUTO_ARCHIVE_AUDIO", "1").lower() not in ("0", "false", "no")
+os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # 1. Local Tools Implementation
@@ -382,6 +388,213 @@ def web_search(query: str, max_results: int = 5, **kwargs) -> dict:
         return {"error": f"Search failed: {str(e)}"}
 
 
+def clean_speech_text(text: str) -> str:
+    """Sanitizes text for natural-sounding speech synthesis."""
+    if not text:
+        return ""
+    # Strip harmony tokens and thinking tags
+    text = re.sub(r"<\|.*?\|>", "", text)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    # Replace code blocks with brief spoken note
+    text = re.sub(r"```[\w]*\n.*?```", " code block omitted ", text, flags=re.DOTALL)
+    text = re.sub(r"```.*?```", " code block omitted ", text, flags=re.DOTALL)
+    # Remove inline backticks
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Remove markdown headers and emphasis
+    text = re.sub(r"#{1,6}\s*", "", text)
+    text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)
+    text = re.sub(r"(\*|_)(.*?)\1", r"\2", text)
+    # Replace markdown links [label](url) with label
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Remove raw URLs
+    text = re.sub(r"https?://\S+", "", text)
+    # Clean list bullets and numbering
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+_PIPER_VOICE_LOCK = threading.Lock()
+_CACHED_PIPER_VOICE = None
+
+
+def get_piper_voice_path() -> str | None:
+    """Finds available Piper ONNX voice models on the system."""
+    env_voice = os.getenv("HARMONY_PIPER_VOICE") or os.getenv("VOICE_AI_TTS_VOICE")
+    if env_voice and os.path.exists(os.path.expanduser(env_voice)):
+        return os.path.expanduser(env_voice)
+
+    search_dirs = [
+        "/var/home/mplanetarian/voice-ai/voices",
+        os.path.expanduser("~/voice-ai/voices"),
+        os.path.expanduser("~/.local/share/piper-voices"),
+        os.path.expanduser("~/MP_REPORTER/share/voices"),
+        "/usr/share/piper-voices",
+    ]
+    pref_names = [
+        "en_GB-jenny_dioco-medium.onnx",
+        "en_GB-cori-medium.onnx",
+        "en_US-lessac-medium.onnx",
+        "en_US-amy-medium.onnx",
+        "en_GB-alba-medium.onnx",
+    ]
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        if env_voice:
+            clean_env = env_voice.lower().strip()
+            for f in os.listdir(d):
+                if clean_env in f.lower() and f.endswith(".onnx"):
+                    return os.path.join(d, f)
+        for pref in pref_names:
+            p = os.path.join(d, pref)
+            if os.path.exists(p):
+                return p
+        for f in os.listdir(d):
+            if f.endswith(".onnx"):
+                return os.path.join(d, f)
+    return None
+
+
+def get_cached_piper_voice():
+    """Lazily loads and caches the Piper voice model."""
+    global _CACHED_PIPER_VOICE
+    with _PIPER_VOICE_LOCK:
+        if _CACHED_PIPER_VOICE is not None:
+            return _CACHED_PIPER_VOICE
+        voice_path = get_piper_voice_path()
+        if not voice_path:
+            return None
+        try:
+            from piper import PiperVoice
+            _CACHED_PIPER_VOICE = PiperVoice.load(voice_path)
+            return _CACHED_PIPER_VOICE
+        except Exception as e:
+            print(f"\033[1;33m[TTS Warning]\033[0m Could not load Piper python model: {e}")
+            return None
+
+
+def notify_audio_saved(audio_path: str, text_path: str):
+    """Notifies via terminal console and system notification that speech files have been saved."""
+    print(f"\n\033[1;32m[Audio Speech Saved]\033[0m {audio_path}")
+    print(f"\033[1;36m[Text Transcript Saved]\033[0m {text_path}\n")
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(
+                [
+                    "notify-send",
+                    "-a", "Harmony Agent",
+                    "-i", "audio-volume-high",
+                    "Audio Speech Response Saved",
+                    f"Audio: {audio_path}\nText: {text_path}",
+                ],
+                timeout=3,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+
+def save_speech_response(text: str, filename_prefix: str = "agent_speech", **kwargs) -> dict:
+    """
+    Synthesizes and saves the agent's speech response to an audio file (.wav) and a companion
+    text transcript (.txt) in the archive directory. Notifies the user with both paths.
+    """
+    if not text or not text.strip():
+        return {"error": "Empty text provided for speech response"}
+
+    os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    unique_suffix = uuid.uuid4().hex[:6]
+    base_name = f"{filename_prefix}_{timestamp}_{unique_suffix}"
+    audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"{base_name}.wav")
+    text_path = os.path.join(AUDIO_OUTPUT_DIR, f"{base_name}.txt")
+
+    # 1. Save companion text transcript
+    try:
+        with open(text_path, "w", encoding="utf-8") as f:
+            f.write(text.strip() + "\n")
+    except Exception as e:
+        return {"error": f"Failed to write text transcript: {e}"}
+
+    # 2. Synthesize audio
+    speech_text = clean_speech_text(text)
+    if not speech_text:
+        speech_text = text.strip()
+
+    audio_saved = False
+    voice = get_cached_piper_voice()
+    if voice:
+        try:
+            with wave.open(audio_path, "wb") as wf:
+                voice.synthesize_wav(speech_text, wf)
+            audio_saved = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+        except Exception as e:
+            print(f"\033[1;33m[TTS Synthesis Error]\033[0m {e}")
+
+    # Fallback to piper CLI
+    if not audio_saved:
+        piper_bin = shutil.which("piper") or os.path.expanduser("~/.local/bin/piper")
+        voice_path = get_piper_voice_path()
+        if voice_path and os.path.exists(piper_bin):
+            try:
+                subprocess.run(
+                    [piper_bin, "-m", voice_path, "-f", audio_path],
+                    input=speech_text,
+                    text=True,
+                    timeout=30,
+                    check=True,
+                    capture_output=True,
+                )
+                audio_saved = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+            except Exception as e:
+                print(f"\033[1;33m[Piper CLI Error]\033[0m {e}")
+
+    # Fallback to espeak-ng
+    if not audio_saved and shutil.which("espeak-ng"):
+        try:
+            subprocess.run(
+                ["espeak-ng", "-w", audio_path, speech_text],
+                timeout=30,
+                check=True,
+                capture_output=True,
+            )
+            audio_saved = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
+        except Exception as e:
+            print(f"\033[1;33m[espeak-ng Error]\033[0m {e}")
+
+    if audio_saved:
+        notify_audio_saved(audio_path, text_path)
+        return {
+            "status": "saved",
+            "audio_path": audio_path,
+            "text_path": text_path,
+            "size_bytes": os.path.getsize(audio_path),
+            "text": text.strip(),
+        }
+    else:
+        print(f"\n\033[1;33m[Warning]\033[0m Audio synthesis failed, but text transcript saved to: {text_path}\n")
+        return {
+            "status": "partial",
+            "error": "Audio synthesis failed",
+            "text_path": text_path,
+            "text": text.strip(),
+        }
+
+
+def auto_archive_speech(text: str):
+    """Automatically schedules background speech synthesis and archiving if enabled."""
+    if not AUDIO_AUTO_ARCHIVE or not text or not text.strip():
+        return
+    t = threading.Thread(target=save_speech_response, args=(text,), daemon=True)
+    t.start()
+
+
 AVAILABLE_TOOLS = {
     "read_file": read_file,
     "read_file_lines": read_file_lines,
@@ -399,6 +612,7 @@ AVAILABLE_TOOLS = {
     "get_agent_memory": get_agent_memory,
     "list_agent_memories": list_agent_memories,
     "web_search": web_search,
+    "save_speech_response": save_speech_response,
 }
 
 
@@ -491,6 +705,7 @@ tool_schemas = [
     ToolDescription(name="get_agent_memory", description="Retrieves a persistent key-value fact.", parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}),
     ToolDescription(name="list_agent_memories", description="Lists all persistent key-value facts.", parameters={"type": "object", "properties": {}}),
     ToolDescription(name="web_search", description="Live web search via DuckDuckGo.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
+    ToolDescription(name="save_speech_response", description="Synthesizes and saves the agent's speech response to an audio file (.wav) and companion transcript (.txt) in the archive directory.", parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
 ]
 
 # ---------------------------------------------------------------------------
@@ -763,6 +978,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
 
                 step = 0
                 client_alive = True
+                accumulated_speech_chunks = []
 
                 while step < MAX_STEPS and client_alive:
                     if GLOBAL_STATE["abort_event"].is_set():
@@ -800,6 +1016,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                         if final_channel_active[0]:
                             clean_piece = re.sub(r"<\|.*?\|>", "", piece)
                             if clean_piece:
+                                accumulated_speech_chunks.append(clean_piece)
                                 sentence_buffer[0] += clean_piece
                                 while re.search(r"[\.\!\?\n]\s", sentence_buffer[0]):
                                     m = re.search(r"[\.\!\?\n]\s", sentence_buffer[0])
@@ -871,6 +1088,20 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                     resp_tokens = enc.encode(raw_response, allowed_special="all")
                     parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
                     convo.messages.extend(parsed_messages)
+
+                # Automatic speech archiving of assistant voice reply
+                speech_to_save = "".join(accumulated_speech_chunks).strip()
+                if not speech_to_save:
+                    speech_parts = []
+                    for msg in parsed_messages:
+                        if getattr(msg, "channel", None) == "final":
+                            pt = extract_content_text(msg).strip()
+                            if pt:
+                                speech_parts.append(pt)
+                    speech_to_save = "\n\n".join(speech_parts).strip()
+
+                if speech_to_save and not GLOBAL_STATE["abort_event"].is_set():
+                    auto_archive_speech(speech_to_save)
         except Exception as e:
             print(f"\n\033[1;31m[Agent Error]\033[0m {e}")
             self.send_sse_chunk(f"An error occurred: {e}")
@@ -906,7 +1137,8 @@ def print_banner(model_name: str, model_info: dict):
     print(f" \033[1mModel Tag\033[0m         : \033[1;32m{model_name}\033[0m")
     print(f" \033[1mArchitecture\033[0m      : {arch.upper()} | {param_size} | {quant}")
     print(f" \033[1mNative Context\033[0m    : {ctx_len}")
-    print(f" \033[1mTools Active\033[0m      : {len(AVAILABLE_TOOLS)} registered (diff, telemetry, jobs, memory, git, web)")
+    print(f" \033[1mTools Active\033[0m      : {len(AVAILABLE_TOOLS)} registered (diff, telemetry, jobs, memory, git, web, audio)")
+    print(f" \033[1mAudio Archive\033[0m     : {AUDIO_OUTPUT_DIR} (auto-archive: {'ON' if AUDIO_AUTO_ARCHIVE else 'OFF'})")
     print(f" \033[1mGuardrails\033[0m        : safe_mode={'ON' if SAFE_MODE else 'OFF'} | auto-pruner={PRUNE_THRESHOLD} tok")
     print("\033[1;36m----------------------------------------------------------------------\033[0m")
 
@@ -920,6 +1152,10 @@ def main():
 
     print_banner(model_name, model_info)
     enc, convo = init_agent()
+
+    # Pre-warm Piper TTS model in background
+    if AUDIO_AUTO_ARCHIVE:
+        threading.Thread(target=get_cached_piper_voice, daemon=True).start()
 
     if "--server" in sys.argv or "-s" in sys.argv:
         GLOBAL_STATE["enc"] = enc
@@ -958,6 +1194,7 @@ def main():
         convo.messages.append(Message.from_role_and_content(Role.USER, user_input))
 
         step = 0
+        cli_speech_parts = []
         while step < MAX_STEPS:
             step += 1
             prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
@@ -991,6 +1228,17 @@ def main():
                     convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
 
             if not tool_called:
+                for msg in parsed_messages:
+                    if getattr(msg, "channel", None) == "final":
+                        t = extract_content_text(msg).strip()
+                        if t:
+                            cli_speech_parts.append(t)
+                if not cli_speech_parts:
+                    for msg in parsed_messages:
+                        if getattr(msg, "channel", None) not in ("thought", "analysis", "commentary") and not (getattr(msg, "recipient", None) and msg.recipient.startswith("functions.")):
+                            t = extract_content_text(msg).strip()
+                            if t:
+                                cli_speech_parts.append(t)
                 break
 
         if tool_called and step >= MAX_STEPS:
@@ -1007,6 +1255,21 @@ def main():
             resp_tokens = enc.encode(raw_response, allowed_special="all")
             parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
             convo.messages.extend(parsed_messages)
+            for msg in parsed_messages:
+                if getattr(msg, "channel", None) == "final":
+                    t = extract_content_text(msg).strip()
+                    if t:
+                        cli_speech_parts.append(t)
+            if not cli_speech_parts:
+                for msg in parsed_messages:
+                    if getattr(msg, "channel", None) not in ("thought", "analysis", "commentary") and not (getattr(msg, "recipient", None) and msg.recipient.startswith("functions.")):
+                        t = extract_content_text(msg).strip()
+                        if t:
+                            cli_speech_parts.append(t)
+
+        final_speech = "\n\n".join(cli_speech_parts).strip()
+        if final_speech:
+            auto_archive_speech(final_speech)
 
 
 if __name__ == "__main__":
