@@ -714,7 +714,7 @@ tool_schemas = [
 def detect_ollama_model() -> str:
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if args:
-        return args[0]
+        return args[0].strip("'\" ;\t\r\n")
     try:
         res = httpx.get("http://localhost:11434/api/tags", timeout=5.0)
         models = [m["name"] for m in res.json().get("models", [])]
