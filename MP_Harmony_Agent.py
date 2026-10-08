@@ -9,6 +9,7 @@ import time
 import uuid
 import readline
 import threading
+import inspect
 import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from openai_harmony import (
@@ -38,8 +39,12 @@ os.makedirs(JOBS_DIR, exist_ok=True)
 # ---------------------------------------------------------------------------
 # 1. Local Tools Implementation
 # ---------------------------------------------------------------------------
-def read_file(filepath: str) -> dict:
-    """Reads the entire content of a file (<64KB)."""
+def read_file(filepath: str, start_line: int = None, end_line: int = None, **kwargs) -> dict:
+    """Reads the entire content of a file (<64KB) or a targeted slice if start_line/end_line are specified."""
+    if start_line is not None or end_line is not None:
+        s = 1 if start_line is None else int(start_line)
+        e = (s + 200) if end_line is None else int(end_line)
+        return read_file_lines(filepath, start_line=s, end_line=e)
     try:
         path = os.path.expanduser(filepath)
         if not os.path.exists(path):
@@ -52,7 +57,7 @@ def read_file(filepath: str) -> dict:
         return {"error": str(e)}
 
 
-def read_file_lines(filepath: str, start_line: int = 1, end_line: int = 200) -> dict:
+def read_file_lines(filepath: str, start_line: int = 1, end_line: int = 200, **kwargs) -> dict:
     """Reads a targeted slice of lines with line numbers (max 250 lines)."""
     try:
         path = os.path.expanduser(filepath)
@@ -71,7 +76,7 @@ def read_file_lines(filepath: str, start_line: int = 1, end_line: int = 200) -> 
         return {"error": str(e)}
 
 
-def search_file_regex(filepath: str, pattern: str, max_results: int = 15) -> dict:
+def search_file_regex(filepath: str, pattern: str, max_results: int = 15, **kwargs) -> dict:
     """Searches a file for regex matches returning line numbers and context."""
     try:
         path = os.path.expanduser(filepath)
@@ -90,7 +95,7 @@ def search_file_regex(filepath: str, pattern: str, max_results: int = 15) -> dic
         return {"error": str(e)}
 
 
-def write_file(filepath: str, content: str) -> dict:
+def write_file(filepath: str, content: str, **kwargs) -> dict:
     """Overwrites or creates a file with automatic .bak backup."""
     try:
         path = os.path.expanduser(filepath)
@@ -111,7 +116,7 @@ def write_file(filepath: str, content: str) -> dict:
         return {"error": str(e)}
 
 
-def patch_file(filepath: str, old_str: str, new_str: str) -> dict:
+def patch_file(filepath: str, old_str: str, new_str: str, **kwargs) -> dict:
     """Exact string replacement with .bak backup."""
     try:
         path = os.path.expanduser(filepath)
@@ -130,7 +135,7 @@ def patch_file(filepath: str, old_str: str, new_str: str) -> dict:
         return {"error": str(e)}
 
 
-def patch_file_diff(filepath: str, diff_patch: str) -> dict:
+def patch_file_diff(filepath: str, diff_patch: str, **kwargs) -> dict:
     """Applies a standard unified diff patch to a target file via patch."""
     try:
         path = os.path.expanduser(filepath)
@@ -153,7 +158,7 @@ def patch_file_diff(filepath: str, diff_patch: str) -> dict:
         return {"error": str(e)}
 
 
-def run_shell_command(command: str) -> dict:
+def run_shell_command(command: str, **kwargs) -> dict:
     """Executes a short foreground bash command with safe_mode protection."""
     if SAFE_MODE:
         destructive = [
@@ -176,7 +181,7 @@ def run_shell_command(command: str) -> dict:
         return {"error": str(e)}
 
 
-def start_background_task(command: str) -> dict:
+def start_background_task(command: str, **kwargs) -> dict:
     """Spawns a long-running process in the background and returns a tracking job_id."""
     job_id = f"job_{int(time.time())}_{str(uuid.uuid4())[:4]}"
     log_file = os.path.join(JOBS_DIR, f"{job_id}.log")
@@ -194,7 +199,7 @@ def start_background_task(command: str) -> dict:
         return {"error": str(e)}
 
 
-def check_background_task(job_id: str, tail_lines: int = 20) -> dict:
+def check_background_task(job_id: str, tail_lines: int = 20, **kwargs) -> dict:
     """Inspects exit status and output tail of a background task."""
     log_file = os.path.join(JOBS_DIR, f"{job_id}.log")
     if not os.path.exists(log_file):
@@ -204,7 +209,7 @@ def check_background_task(job_id: str, tail_lines: int = 20) -> dict:
     return {"job_id": job_id, "recent_logs": tail_res.stdout.strip()}
 
 
-def get_system_telemetry() -> dict:
+def get_system_telemetry(**kwargs) -> dict:
     """Collects CPU load, host RAM/swap, and NVIDIA GPU telemetry."""
     telemetry = {}
     try:
@@ -232,7 +237,7 @@ def get_system_telemetry() -> dict:
     return telemetry
 
 
-def git_checkpoint(repo_path: str, message: str) -> dict:
+def git_checkpoint(repo_path: str, message: str, **kwargs) -> dict:
     """Creates a temporary safety commit or stash in a git repository."""
     path = os.path.expanduser(repo_path)
     tag = f"harmony_ckpt_{int(time.time())}"
@@ -241,7 +246,7 @@ def git_checkpoint(repo_path: str, message: str) -> dict:
     return {"repo": path, "checkpoint_tag": tag, "output": res.stdout.strip() or res.stderr.strip()}
 
 
-def git_rollback(repo_path: str) -> dict:
+def git_rollback(repo_path: str, **kwargs) -> dict:
     """Reverts changes in a repo back to the previous commit."""
     path = os.path.expanduser(repo_path)
     cmd = f"cd '{path}' && git reset --hard HEAD~1"
@@ -249,7 +254,7 @@ def git_rollback(repo_path: str) -> dict:
     return {"repo": path, "status": "rolled back", "output": res.stdout.strip()}
 
 
-def set_agent_memory(key: str, value: str) -> dict:
+def set_agent_memory(key: str, value: str, **kwargs) -> dict:
     """Saves a persistent configuration key-value pair to disk."""
     memories = {}
     if os.path.exists(MEMORY_FILE):
@@ -264,7 +269,7 @@ def set_agent_memory(key: str, value: str) -> dict:
     return {"status": "saved", "key": key, "value": value}
 
 
-def get_agent_memory(key: str) -> dict:
+def get_agent_memory(key: str, **kwargs) -> dict:
     """Retrieves a persistent configuration key-value pair."""
     if not os.path.exists(MEMORY_FILE):
         return {"error": "No memory file initialized."}
@@ -276,7 +281,7 @@ def get_agent_memory(key: str) -> dict:
         return {"error": str(e)}
 
 
-def list_agent_memories() -> dict:
+def list_agent_memories(**kwargs) -> dict:
     """Lists all stored persistent configuration facts."""
     if not os.path.exists(MEMORY_FILE):
         return {"memories": {}}
@@ -287,7 +292,7 @@ def list_agent_memories() -> dict:
         return {"error": str(e)}
 
 
-def web_search(query: str, max_results: int = 5) -> dict:
+def web_search(query: str, max_results: int = 5, **kwargs) -> dict:
     """Searches the live web via DuckDuckGo without API keys."""
     try:
         from ddgs import DDGS
@@ -325,11 +330,58 @@ AVAILABLE_TOOLS = {
     "web_search": web_search,
 }
 
+
+def dispatch_tool(func_name: str, kwargs: dict) -> dict:
+    """Safely executes a registered tool with argument normalization, signature filtering, and error isolation."""
+    if func_name not in AVAILABLE_TOOLS:
+        return {"error": f"Tool '{func_name}' not found."}
+
+    # Parameter aliases normalization
+    if "filepath" not in kwargs:
+        for alias in ("path", "file", "filename"):
+            if alias in kwargs:
+                kwargs["filepath"] = kwargs[alias]
+                break
+
+    if "command" not in kwargs and "cmd" in kwargs:
+        kwargs["command"] = kwargs["cmd"]
+
+    if "diff_patch" not in kwargs:
+        for alias in ("patch", "diff"):
+            if alias in kwargs:
+                kwargs["diff_patch"] = kwargs[alias]
+                break
+
+    if "old_str" not in kwargs:
+        for alias in ("old_text", "target", "old_string", "search"):
+            if alias in kwargs:
+                kwargs["old_str"] = kwargs[alias]
+                break
+
+    if "new_str" not in kwargs:
+        for alias in ("new_text", "replacement", "new_string", "replace"):
+            if alias in kwargs:
+                kwargs["new_str"] = kwargs[alias]
+                break
+
+    func = AVAILABLE_TOOLS[func_name]
+    try:
+        return func(**kwargs)
+    except TypeError as te:
+        try:
+            sig = inspect.signature(func)
+            filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+            return func(**filtered)
+        except Exception as e:
+            return {"error": f"Tool '{func_name}' parameter error: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Tool '{func_name}' execution error: {str(e)}"}
+
 # ---------------------------------------------------------------------------
 # 2. Tool Schemas Registered for Harmony
 # ---------------------------------------------------------------------------
 tool_schemas = [
-    ToolDescription(name="read_file", description="Reads small files (<64KB).", parameters={"type": "object", "properties": {"filepath": {"type": "string"}}, "required": ["filepath"]}),
+    ToolDescription(name="read_file", description="Reads small files (<64KB), or a targeted line slice if start_line/end_line are specified.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["filepath"]}),
     ToolDescription(name="read_file_lines", description="Reads a line slice (max 250) with line numbers.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, "required": ["filepath"]}),
     ToolDescription(name="search_file_regex", description="Searches massive files for regex patterns.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "pattern": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["filepath", "pattern"]}),
     ToolDescription(name="write_file", description="Writes file with .bak backup.", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}),
@@ -665,7 +717,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                         print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
                         print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
 
-                        res = AVAILABLE_TOOLS[func_name](**kwargs) if func_name in AVAILABLE_TOOLS else {"error": f"Tool '{func_name}' not found."}
+                        res = dispatch_tool(func_name, kwargs)
                         preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
                         print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
 
@@ -778,7 +830,7 @@ def main():
                     print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
                     print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
 
-                    res = AVAILABLE_TOOLS[func_name](**kwargs) if func_name in AVAILABLE_TOOLS else {"error": f"Tool '{func_name}' not found."}
+                    res = dispatch_tool(func_name, kwargs)
                     preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
                     print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
 
