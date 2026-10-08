@@ -552,26 +552,43 @@ GLOBAL_STATE = {
 }
 
 class HarmonyBridgeHandler(BaseHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        self.write_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
     def log_message(self, format, *args):
         pass
 
+    def send_sse_ping(self) -> bool:
+        """Sends an SSE keep-alive comment line to keep the client read socket alive."""
+        with self.write_lock:
+            try:
+                self.wfile.write(b": keep-alive\n\n")
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+            except Exception:
+                return False
+
     def send_sse_chunk(self, content_str: str) -> bool:
         """Sends an SSE delta chunk. Catches BrokenPipeError/ConnectionResetError if client disconnects."""
-        try:
-            chunk = {
-                "id": "chatcmpl-harmony",
-                "object": "chat.completion.chunk",
-                "choices": [{"delta": {"content": content_str}, "index": 0}],
-            }
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
-            self.wfile.flush()
-            return True
-        except (BrokenPipeError, ConnectionResetError):
-            print("\n\033[1;33m[Client Disconnected]\033[0m Voice client closed the socket prematurely.")
-            return False
-        except Exception as e:
-            print(f"\n\033[1;31m[SSE Write Error]\033[0m {e}")
-            return False
+        with self.write_lock:
+            try:
+                chunk = {
+                    "id": "chatcmpl-harmony",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"delta": {"content": content_str}, "index": 0}],
+                }
+                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                print("\n\033[1;33m[Client Disconnected]\033[0m Voice client closed the socket prematurely.")
+                return False
+            except Exception as e:
+                print(f"\n\033[1;31m[SSE Write Error]\033[0m {e}")
+                return False
 
     def do_POST(self):
         # 1. Voice Interruption / Barge-in Endpoint
@@ -634,105 +651,125 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
 
-        with GLOBAL_STATE["lock"]:
-            prune_conversation_if_needed(convo, enc)
-            convo.messages.append(Message.from_role_and_content(Role.USER, last_user_msg))
+        stop_heartbeat = threading.Event()
 
-            step = 0
-            client_alive = True
-
-            while step < 8 and client_alive:
-                if GLOBAL_STATE["abort_event"].is_set():
+        def heartbeat_worker():
+            while not stop_heartbeat.wait(4.0):
+                if not self.send_sse_ping():
+                    GLOBAL_STATE["abort_event"].set()
                     break
-                step += 1
-                prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
-                prompt_text = enc.decode(prompt_tokens)
 
-                print(f"\033[1;30m[Agent Step {step}] Generating...\033[0m")
-
-                # Channel parser state machine for real-time streaming
-                raw_token_window = []
-                final_channel_active = [False]
-                sentence_buffer = [""]
-
-                def live_token_callback(piece: str):
-                    nonlocal client_alive
-                    if not client_alive or GLOBAL_STATE["abort_event"].is_set():
-                        return
-
-                    raw_token_window.append(piece)
-                    window = "".join(raw_token_window[-12:])
-
-                    # Identify entry into the final user channel
-                    if "final<|message|>" in window or (not final_channel_active[0] and "final" in window and "<|message|>" in piece):
-                        final_channel_active[0] = True
-                        return
-
-                    # Identify exit from channel
-                    if final_channel_active[0] and ("<|end|>" in piece or "<|call|>" in piece):
-                        final_channel_active[0] = False
-                        return
-
-                    # Forward sentence chunks live
-                    if final_channel_active[0]:
-                        clean_piece = re.sub(r"<\|.*?\|>", "", piece)
-                        if clean_piece:
-                            sentence_buffer[0] += clean_piece
-                            while re.search(r"[\.\!\?\n]\s", sentence_buffer[0]):
-                                m = re.search(r"[\.\!\?\n]\s", sentence_buffer[0])
-                                idx = m.end()
-                                chunk_to_send = sentence_buffer[0][:idx]
-                                sentence_buffer[0] = sentence_buffer[0][idx:]
-                                if not self.send_sse_chunk(chunk_to_send):
-                                    client_alive = False
-                                    GLOBAL_STATE["abort_event"].set()
-                                    break
-
-                raw_response = stream_ollama_with_callback(
-                    prompt_text,
-                    model_name,
-                    on_token=live_token_callback,
-                    stop_event=GLOBAL_STATE["abort_event"],
-                )
-
-                # Flush any residual text in the buffer
-                if sentence_buffer[0].strip() and client_alive and not GLOBAL_STATE["abort_event"].is_set():
-                    self.send_sse_chunk(sentence_buffer[0])
-
-                resp_tokens = enc.encode(raw_response, allowed_special="all")
-                parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
-                convo.messages.extend(parsed_messages)
-
-                tool_called = False
-                for msg in parsed_messages:
-                    if msg.recipient and msg.recipient.startswith("functions."):
-                        tool_called = True
-                        func_name = msg.recipient.split("functions.", 1)[1]
-                        raw_args = extract_content_text(msg)
-                        try:
-                            kwargs = json.loads(raw_args)
-                        except Exception:
-                            kwargs = {}
-
-                        print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
-                        print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
-
-                        res = dispatch_tool(func_name, kwargs)
-                        preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
-                        print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
-
-                        convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
-
-                if not tool_called:
-                    break
+        heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+        heartbeat_thread.start()
 
         try:
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+            with GLOBAL_STATE["lock"]:
+                prune_conversation_if_needed(convo, enc)
+                convo.messages.append(Message.from_role_and_content(Role.USER, last_user_msg))
 
-        self.close_connection = True
+                step = 0
+                client_alive = True
+
+                while step < 8 and client_alive:
+                    if GLOBAL_STATE["abort_event"].is_set():
+                        break
+                    step += 1
+                    prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+                    prompt_text = enc.decode(prompt_tokens)
+
+                    print(f"\033[1;30m[Agent Step {step}] Generating...\033[0m")
+
+                    # Channel parser state machine for real-time streaming
+                    raw_token_window = []
+                    final_channel_active = [False]
+                    sentence_buffer = [""]
+
+                    def live_token_callback(piece: str):
+                        nonlocal client_alive
+                        if not client_alive or GLOBAL_STATE["abort_event"].is_set():
+                            return
+
+                        raw_token_window.append(piece)
+                        window = "".join(raw_token_window[-12:])
+
+                        # Identify entry into the final user channel
+                        if "final<|message|>" in window or (not final_channel_active[0] and "final" in window and "<|message|>" in piece):
+                            final_channel_active[0] = True
+                            return
+
+                        # Identify exit from channel
+                        if final_channel_active[0] and ("<|end|>" in piece or "<|call|>" in piece):
+                            final_channel_active[0] = False
+                            return
+
+                        # Forward sentence chunks live
+                        if final_channel_active[0]:
+                            clean_piece = re.sub(r"<\|.*?\|>", "", piece)
+                            if clean_piece:
+                                sentence_buffer[0] += clean_piece
+                                while re.search(r"[\.\!\?\n]\s", sentence_buffer[0]):
+                                    m = re.search(r"[\.\!\?\n]\s", sentence_buffer[0])
+                                    idx = m.end()
+                                    chunk_to_send = sentence_buffer[0][:idx]
+                                    sentence_buffer[0] = sentence_buffer[0][idx:]
+                                    if not self.send_sse_chunk(chunk_to_send):
+                                        client_alive = False
+                                        GLOBAL_STATE["abort_event"].set()
+                                        break
+
+                    raw_response = stream_ollama_with_callback(
+                        prompt_text,
+                        model_name,
+                        on_token=live_token_callback,
+                        stop_event=GLOBAL_STATE["abort_event"],
+                    )
+
+                    # Flush any residual text in the buffer
+                    if sentence_buffer[0].strip() and client_alive and not GLOBAL_STATE["abort_event"].is_set():
+                        self.send_sse_chunk(sentence_buffer[0])
+
+                    resp_tokens = enc.encode(raw_response, allowed_special="all")
+                    parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
+                    convo.messages.extend(parsed_messages)
+
+                    tool_called = False
+                    for msg in parsed_messages:
+                        if msg.recipient and msg.recipient.startswith("functions."):
+                            tool_called = True
+                            func_name = msg.recipient.split("functions.", 1)[1]
+                            raw_args = extract_content_text(msg)
+                            try:
+                                kwargs = json.loads(raw_args)
+                            except Exception:
+                                kwargs = {}
+
+                            print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
+                            print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
+
+                            res = dispatch_tool(func_name, kwargs)
+                            preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
+                            print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
+
+                            convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
+
+                    if not tool_called:
+                        break
+        except Exception as e:
+            print(f"\n\033[1;31m[Agent Error]\033[0m {e}")
+            self.send_sse_chunk(f"An error occurred: {e}")
+        finally:
+            stop_heartbeat.set()
+            try:
+                heartbeat_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            try:
+                with self.write_lock:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
 
 
 # ---------------------------------------------------------------------------
