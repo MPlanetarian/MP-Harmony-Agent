@@ -11,6 +11,8 @@ import readline
 import threading
 import inspect
 import wave
+import queue
+import urllib.parse
 import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from openai_harmony import (
@@ -42,6 +44,13 @@ AUDIO_OUTPUT_DIR = os.path.expanduser(
 )
 AUDIO_AUTO_ARCHIVE = os.getenv("HARMONY_AUTO_ARCHIVE_AUDIO", "1").lower() not in ("0", "false", "no")
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+
+# Persistent Ollama HTTP connection pool
+_OLLAMA_CLIENT = httpx.Client(
+    base_url="http://localhost:11434",
+    timeout=httpx.Timeout(300.0, connect=10.0),
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+)
 
 # ---------------------------------------------------------------------------
 # 1. Local Tools Implementation
@@ -262,6 +271,7 @@ def start_background_task(command: str, **kwargs) -> dict:
     """Spawns a long-running process in the background and returns a tracking job_id."""
     job_id = f"job_{int(time.time())}_{str(uuid.uuid4())[:4]}"
     log_file = os.path.join(JOBS_DIR, f"{job_id}.log")
+    meta_file = os.path.join(JOBS_DIR, f"{job_id}.meta")
     try:
         with open(log_file, "w") as out:
             proc = subprocess.Popen(
@@ -271,19 +281,63 @@ def start_background_task(command: str, **kwargs) -> dict:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+        meta = {"job_id": job_id, "pid": proc.pid, "command": command, "started_at": time.time()}
+        with open(meta_file, "w") as mf:
+            json.dump(meta, mf)
         return {"job_id": job_id, "pid": proc.pid, "log_file": log_file, "status": "started"}
     except Exception as e:
         return {"error": str(e)}
 
 
+def stop_background_task(job_id: str, **kwargs) -> dict:
+    """Terminates a running background task process by its job_id."""
+    meta_file = os.path.join(JOBS_DIR, f"{job_id}.meta")
+    pid = None
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, "r") as mf:
+                meta = json.load(mf)
+                pid = meta.get("pid")
+        except Exception:
+            pass
+    if not pid:
+        return {"error": f"No job or PID record found for job_id '{job_id}'."}
+    try:
+        import signal
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        time.sleep(0.5)
+        return {"job_id": job_id, "status": "terminated", "pid": pid}
+    except ProcessLookupError:
+        return {"job_id": job_id, "status": "process already exited", "pid": pid}
+    except Exception as e:
+        return {"error": f"Failed to stop job '{job_id}': {str(e)}"}
+
+
 def check_background_task(job_id: str, tail_lines: int = 20, **kwargs) -> dict:
     """Inspects exit status and output tail of a background task."""
     log_file = os.path.join(JOBS_DIR, f"{job_id}.log")
+    meta_file = os.path.join(JOBS_DIR, f"{job_id}.meta")
     if not os.path.exists(log_file):
         return {"error": f"No job found with id '{job_id}'."}
+
+    status = "unknown"
+    pid = None
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, "r") as mf:
+                meta = json.load(mf)
+                pid = meta.get("pid")
+                if pid:
+                    os.kill(pid, 0)
+                    status = "running"
+        except ProcessLookupError:
+            status = "completed"
+        except Exception:
+            pass
+
     tail_cmd = f"tail -n {tail_lines} '{log_file}'"
     tail_res = subprocess.run(tail_cmd, shell=True, capture_output=True, text=True)
-    return {"job_id": job_id, "recent_logs": tail_res.stdout.strip()}
+    return {"job_id": job_id, "status": status, "pid": pid, "recent_logs": tail_res.stdout.strip()}
 
 
 def get_system_telemetry(**kwargs) -> dict:
@@ -386,6 +440,240 @@ def web_search(query: str, max_results: int = 5, **kwargs) -> dict:
         return {"query": query, "results": results, "count": len(results)}
     except Exception as e:
         return {"error": f"Search failed: {str(e)}"}
+
+
+def list_directory(path: str = ".", show_hidden: bool = False, max_items: int = 60, **kwargs) -> dict:
+    """Lists directory contents with file types, sizes in KB, and modification dates."""
+    try:
+        p = resolve_filepath(path)
+        if not os.path.exists(p):
+            return {"error": f"Directory not found: {p}"}
+        if not os.path.isdir(p):
+            return {"error": f"Path is a file, not a directory: {p}"}
+
+        entries = []
+        for name in sorted(os.listdir(p)):
+            if not show_hidden and name.startswith("."):
+                continue
+            full = os.path.join(p, name)
+            is_dir = os.path.isdir(full)
+            size_kb = round(os.path.getsize(full) / 1024, 1) if not is_dir else 0
+            mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full)))
+            entries.append({
+                "name": name,
+                "type": "directory" if is_dir else "file",
+                "size_kb": size_kb if not is_dir else None,
+                "modified": mtime,
+            })
+            if len(entries) >= int(max_items):
+                break
+        return {"directory": p, "count": len(entries), "entries": entries}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def get_mix_archive_roots() -> list[str]:
+    """Finds all configured Mix Archive directories on the host."""
+    roots = []
+    cfg_paths = [
+        "/var/home/mplanetarian/MP_Mix_Manager_v0.3/config.env",
+        os.path.expanduser("~/MP_Mix_Manager_v0.3/config.env"),
+    ]
+    for cfg in cfg_paths:
+        if os.path.exists(cfg):
+            try:
+                with open(cfg, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("MIX_ARCHIVE_DIR="):
+                            val = line.split("=", 1)[1].strip('"\'; ')
+                            if val and os.path.isdir(val) and val not in roots:
+                                roots.append(val)
+                        elif line.startswith("EXTRA_MIX_ARCHIVE_DIRS="):
+                            val = line.split("=", 1)[1].strip('"\'; ')
+                            for p in val.split(":"):
+                                p = p.strip()
+                                if p and os.path.isdir(p) and p not in roots:
+                                    roots.append(p)
+            except Exception:
+                pass
+
+    defaults = [
+        "/run/media/mplanetarian/WD BLACK B/MIX_ARCHIVE",
+        "/var/home/mplanetarian/MP_Mix_Manager_v0.3/MIX_ARCHIVE",
+        "/run/media/mplanetarian/DATA/MIX_ARCHIVE2",
+        "/var/home/mplanetarian/GoogleDrive/MIX_ARCHIVE",
+    ]
+    for d in defaults:
+        if os.path.isdir(d) and d not in roots:
+            roots.append(d)
+    return roots
+
+
+def search_mix_archive(query: str = "", max_results: int = 15, **kwargs) -> dict:
+    """Searches the user's Mix Archive for audio mixes, companion tracklists, and spectrograms."""
+    roots = get_mix_archive_roots()
+    if not roots:
+        return {"error": "No accessible Mix Archive directory found on host."}
+
+    q = (query or "").lower().strip()
+    matches = []
+    audio_exts = (".flac", ".wav", ".mp3", ".m4a")
+
+    for root in roots:
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                if any(fname.lower().endswith(ext) for ext in audio_exts):
+                    if not q or q in fname.lower():
+                        full_path = os.path.join(dirpath, fname)
+                        size_mb = round(os.path.getsize(full_path) / (1024 * 1024), 1)
+                        base_stem = os.path.splitext(fname)[0]
+                        txt_path = os.path.join(dirpath, f"{base_stem}.txt")
+                        has_tracklist = os.path.exists(txt_path)
+                        matches.append({
+                            "title": fname,
+                            "path": full_path,
+                            "size_mb": size_mb,
+                            "folder": os.path.basename(dirpath),
+                            "tracklist": txt_path if has_tracklist else None,
+                        })
+                        if len(matches) >= int(max_results):
+                            break
+            if len(matches) >= int(max_results):
+                break
+
+    return {"query": query, "count": len(matches), "archive_roots": roots, "results": matches}
+
+
+def play_mix_or_audio(target: str = "latest", command: str = "play", **kwargs) -> dict:
+    """
+    Controls playback or plays a specific mix using MP Audio Player.
+    Commands: 'play', 'pause', 'toggle', 'stop', 'latest', 'status'.
+    Target: filepath, mix title keyword, or 'latest'.
+    """
+    player_script = "/var/home/mplanetarian/MP_Mix_Manager_v0.3/MP_Audio_Player.py"
+    if not os.path.exists(player_script):
+        player_script = os.path.expanduser("~/MP_Mix_Manager_v0.3/MP_Audio_Player.py")
+
+    cmd = (command or "play").lower().strip()
+
+    # Direct IPC commands if user specifies pause, toggle, stop, status
+    if cmd in ("pause", "toggle", "stop", "status"):
+        if os.path.exists(player_script):
+            flag = f"--{cmd}"
+            res = subprocess.run([sys.executable, player_script, flag], capture_output=True, text=True, timeout=10)
+            return {"command": cmd, "status": "executed", "output": res.stdout.strip() or res.stderr.strip()}
+
+    # Resolve target audio file
+    target_path = None
+    target_str = (target or "").strip()
+    if target_str in ("latest", "newest", "recent", "") or cmd == "latest":
+        if os.path.exists(player_script):
+            res = subprocess.run([sys.executable, player_script, "--get-latest-mix"], capture_output=True, text=True, timeout=10)
+            latest = res.stdout.strip()
+            if latest and os.path.exists(latest):
+                target_path = latest
+    elif os.path.exists(os.path.expanduser(target_str)):
+        target_path = os.path.abspath(os.path.expanduser(target_str))
+    else:
+        # Search mix archive for best keyword match
+        search_res = search_mix_archive(target_str, max_results=1)
+        if search_res.get("results"):
+            target_path = search_res["results"][0]["path"]
+
+    if not target_path or not os.path.exists(target_path):
+        return {"error": f"Audio file not found for target '{target}'."}
+
+    # Dispatch to MP Audio Player
+    if os.path.exists(player_script):
+        subprocess.Popen(
+            [sys.executable, player_script, "--play", target_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return {
+            "status": "playback started",
+            "player": "MP_Audio_Player",
+            "mix": os.path.basename(target_path),
+            "path": target_path,
+        }
+
+    # Fallback to system audio player
+    for fallback in ("pw-play", "paplay", "mpv"):
+        if shutil.which(fallback):
+            args = [fallback, target_path] if fallback != "mpv" else ["mpv", "--no-video", target_path]
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return {"status": "playback started", "player": fallback, "mix": os.path.basename(target_path), "path": target_path}
+
+    return {"error": "No compatible audio player found on system."}
+
+
+def get_mix_archive_stats(**kwargs) -> dict:
+    """Returns statistics about the user's Mix Archive including track counts, storage used, and recent mixes."""
+    roots = get_mix_archive_roots()
+    if not roots:
+        return {"error": "No accessible Mix Archive found on host."}
+
+    total_files = 0
+    total_bytes = 0
+    format_counts = {"flac": 0, "wav": 0, "mp3": 0, "mp4": 0, "other": 0}
+    recent_mixes = []
+
+    for root in roots:
+        for dirpath, _, filenames in os.walk(root):
+            for fname in filenames:
+                ext = os.path.splitext(fname)[1].lower().lstrip(".")
+                if ext in format_counts:
+                    format_counts[ext] += 1
+                    total_files += 1
+                    full_p = os.path.join(dirpath, fname)
+                    sz = os.path.getsize(full_p)
+                    total_bytes += sz
+                    mtime = os.path.getmtime(full_p)
+                    recent_mixes.append((mtime, fname, full_p, round(sz / (1024 * 1024), 1)))
+
+    recent_mixes.sort(key=lambda x: x[0], reverse=True)
+    top_recent = [
+        {"title": x[1], "path": x[2], "size_mb": x[3], "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(x[0]))}
+        for x in recent_mixes[:3]
+    ]
+
+    total_gb = round(total_bytes / (1024 ** 3), 2)
+    return {
+        "archive_roots": roots,
+        "total_audio_files": total_files,
+        "total_storage_gb": total_gb,
+        "formats": format_counts,
+        "latest_mixes": top_recent,
+    }
+
+
+def system_audio_volume(action: str = "status", level: int = None, **kwargs) -> dict:
+    """Controls or inspects host audio volume via PipeWire / WirePlumber (wpctl)."""
+    act = (action or "status").lower().strip()
+    try:
+        if act == "status":
+            res = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True, text=True, timeout=5)
+            out = res.stdout.strip()
+            muted = "[MUTED]" in out
+            m = re.search(r"Volume:\s*([0-9.]+)", out)
+            vol_pct = round(float(m.group(1)) * 100) if m else None
+            return {"status": "ok", "volume_percent": vol_pct, "muted": muted, "raw": out}
+
+        elif act == "set" and level is not None:
+            lvl = max(0, min(150, int(level)))
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{lvl}%"], check=True, timeout=5)
+            return {"status": "volume set", "level_percent": lvl}
+
+        elif act in ("mute", "unmute", "toggle_mute", "toggle"):
+            subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], check=True, timeout=5)
+            status = system_audio_volume(action="status")
+            return {"status": "mute toggled", "muted": status.get("muted")}
+
+        return {"error": f"Unsupported action '{action}'. Use 'status', 'set' with level, or 'toggle_mute'."}
+    except Exception as e:
+        return {"error": f"Volume control failed: {str(e)}"}
 
 
 def clean_speech_text(text: str) -> str:
@@ -587,12 +875,29 @@ def save_speech_response(text: str, filename_prefix: str = "agent_speech", **kwa
         }
 
 
+_TTS_QUEUE = queue.Queue()
+
+def _tts_worker_loop():
+    while True:
+        try:
+            text = _TTS_QUEUE.get()
+            if text is None:
+                break
+            save_speech_response(text)
+        except Exception as e:
+            print(f"\033[1;33m[TTS Queue Error]\033[0m {e}")
+        finally:
+            _TTS_QUEUE.task_done()
+
+_TTS_WORKER_THREAD = threading.Thread(target=_tts_worker_loop, daemon=True)
+_TTS_WORKER_THREAD.start()
+
+
 def auto_archive_speech(text: str):
-    """Automatically schedules background speech synthesis and archiving if enabled."""
+    """Automatically schedules background speech synthesis and archiving through a serialized queue."""
     if not AUDIO_AUTO_ARCHIVE or not text or not text.strip():
         return
-    t = threading.Thread(target=save_speech_response, args=(text,), daemon=True)
-    t.start()
+    _TTS_QUEUE.put(text.strip())
 
 
 AVAILABLE_TOOLS = {
@@ -605,6 +910,8 @@ AVAILABLE_TOOLS = {
     "run_shell_command": run_shell_command,
     "start_background_task": start_background_task,
     "check_background_task": check_background_task,
+    "stop_background_task": stop_background_task,
+    "list_directory": list_directory,
     "get_system_telemetry": get_system_telemetry,
     "git_checkpoint": git_checkpoint,
     "git_rollback": git_rollback,
@@ -613,6 +920,10 @@ AVAILABLE_TOOLS = {
     "list_agent_memories": list_agent_memories,
     "web_search": web_search,
     "save_speech_response": save_speech_response,
+    "search_mix_archive": search_mix_archive,
+    "play_mix_or_audio": play_mix_or_audio,
+    "get_mix_archive_stats": get_mix_archive_stats,
+    "system_audio_volume": system_audio_volume,
 }
 
 
@@ -672,6 +983,18 @@ def dispatch_tool(func_name: str, kwargs: dict) -> dict:
                 kwargs["new_str"] = kwargs[alias]
                 break
 
+    if "query" not in kwargs:
+        for alias in ("search", "q", "term", "mix_query"):
+            if alias in kwargs:
+                kwargs["query"] = kwargs[alias]
+                break
+
+    if "target" not in kwargs:
+        for alias in ("mix", "track", "audio", "file", "filename"):
+            if alias in kwargs:
+                kwargs["target"] = kwargs[alias]
+                break
+
     func = AVAILABLE_TOOLS[func_name]
     try:
         return func(**kwargs)
@@ -705,7 +1028,13 @@ tool_schemas = [
     ToolDescription(name="get_agent_memory", description="Retrieves a persistent key-value fact.", parameters={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}),
     ToolDescription(name="list_agent_memories", description="Lists all persistent key-value facts.", parameters={"type": "object", "properties": {}}),
     ToolDescription(name="web_search", description="Live web search via DuckDuckGo.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
+    ToolDescription(name="list_directory", description="Lists directory contents with file types, sizes in KB, and modified dates.", parameters={"type": "object", "properties": {"path": {"type": "string"}, "show_hidden": {"type": "boolean"}, "max_items": {"type": "integer"}}, "required": ["path"]}),
+    ToolDescription(name="stop_background_task", description="Terminates a running background task process by its job_id.", parameters={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}),
     ToolDescription(name="save_speech_response", description="Synthesizes and saves the agent's speech response to an audio file (.wav) and companion transcript (.txt) in the archive directory.", parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
+    ToolDescription(name="search_mix_archive", description="Searches user's Mix Archive for audio mixes, companion tracklists, and spectrograms.", parameters={"type": "object", "properties": {"query": {"type": "string"}, "max_results": {"type": "integer"}}, "required": ["query"]}),
+    ToolDescription(name="play_mix_or_audio", description="Controls DJ playback or plays an audio mix (using MP Audio Player). Commands: 'play', 'pause', 'toggle', 'stop', 'latest', 'status'. Target: filepath, keyword, or 'latest'.", parameters={"type": "object", "properties": {"target": {"type": "string"}, "command": {"type": "string"}}, "required": []}),
+    ToolDescription(name="get_mix_archive_stats", description="Returns statistics about the user's Mix Archive (counts by format, total GB, and latest 3 mixes).", parameters={"type": "object", "properties": {}}),
+    ToolDescription(name="system_audio_volume", description="Inspects or controls host audio volume via PipeWire / WirePlumber. Actions: 'status', 'set' (with level 0-100), 'toggle_mute'.", parameters={"type": "object", "properties": {"action": {"type": "string"}, "level": {"type": "integer"}}, "required": ["action"]}),
 ]
 
 # ---------------------------------------------------------------------------
@@ -737,26 +1066,40 @@ def get_ollama_model_info(model_name: str) -> dict:
 def prune_conversation_if_needed(convo: Conversation, enc) -> int:
     tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
     current = len(tokens)
+    if current <= PRUNE_THRESHOLD:
+        return current
+
     pinned = 2
     pruned = 0
+    excess = current - PRUNE_THRESHOLD
+    est_to_drop = max(2, min(len(convo.messages) - (pinned + 2), excess // 160))
+    for _ in range(est_to_drop):
+        if len(convo.messages) > (pinned + 2):
+            convo.messages.pop(pinned)
+            pruned += 1
+
+    tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+    current = len(tokens)
+
     while current > PRUNE_THRESHOLD and len(convo.messages) > (pinned + 2):
         convo.messages.pop(pinned)
         pruned += 1
         tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
         current = len(tokens)
+
     if pruned:
         print(f"\033[1;33m[Context Window]\033[0m Pruned {pruned} messages. Active tokens: {current:,}")
     return current
 
 
 def stream_ollama_with_callback(prompt_text: str, model_name: str, on_token=None, stop_event: threading.Event = None) -> str:
-    """Streams token chunks live from Ollama with repetition penalty and loop-break guardrail."""
+    """Streams token chunks live from Ollama with persistent connection pooling and loop-break guardrail."""
     full = []
     recent_sliding = []
     
-    with httpx.stream(
+    with _OLLAMA_CLIENT.stream(
         "POST",
-        "http://localhost:11434/api/generate",
+        "/api/generate",
         json={
             "model": model_name,
             "prompt": prompt_text,
@@ -772,7 +1115,6 @@ def stream_ollama_with_callback(prompt_text: str, model_name: str, on_token=None
                 "top_p": 0.9,
             },
         },
-        timeout=300.0,
     ) as response:
         if response.status_code != 200:
             raise RuntimeError(f"Ollama error {response.status_code}: {response.text}")
@@ -831,15 +1173,17 @@ def init_agent():
     dev_content = (
         DeveloperContent.new()
         .with_instructions(
-            "You are an autonomous local system administration, scripting, and technical research assistant. "
-            "When modifying files, running commands, monitoring hardware, or managing long background tasks, "
+            "You are an autonomous local system administration, scripting, technical research, and DJ Mix Studio assistant. "
+            "When modifying files, running commands, monitoring hardware, managing long background tasks, or managing music/mixes, "
             "YOU MUST ALWAYS INVOKE YOUR PROVIDED TOOLS. "
+            "For inspecting directory contents, use `list_directory`. "
             "For large files (>300 lines), NEVER read them entirely: use `search_file_regex` or `read_file_lines`. "
             "For multi-file modifications, use `git_checkpoint`. "
-            "For commands running longer than 30s, use `start_background_task`. "
-            "When asked to write a review, report, or recommendations to a file, compose the text directly "
-            "and invoke `write_file` to save it to disk. Do NOT loop repetitive statements in your analysis scratchpad. "
-            "Summarize all voice replies concisely in the final channel."
+            "For long background jobs, use `start_background_task`, `check_background_task`, or `stop_background_task`. "
+            "You have dedicated tools for the user's Mix Archive and DJ studio: `search_mix_archive` to find mixes and tracklists, "
+            "`play_mix_or_audio` to start/pause/stop playback via MP Audio Player, `get_mix_archive_stats` for storage and mix counts, "
+            "and `system_audio_volume` for audio volume and muting. "
+            "When replying via voice in the final channel, speak naturally and conversationally. Avoid bulleted lists, markdown symbols, and code blocks."
             + memory_summary
         )
         .with_function_tools(tool_schemas)
@@ -867,6 +1211,89 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
         pass
+
+    def send_cors_headers(self):
+        """Injects cross-origin resource sharing headers for Open WebUI & web harnesses."""
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def do_OPTIONS(self):
+        """Handles browser pre-flight CORS verification requests."""
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        """Handles OpenAI model discovery (/v1/models) and liveness health checks."""
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path.rstrip("/")
+        if not path:
+            path = "/"
+
+        if path in ("/v1/models", "/models"):
+            model_name = GLOBAL_STATE.get("model_name", "gpt-oss-pinned:latest")
+            models_data = [
+                {
+                    "id": model_name,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "harmony-agent",
+                    "permission": [],
+                    "root": model_name,
+                    "parent": None,
+                }
+            ]
+            if model_name != "gpt-oss-pinned:latest":
+                models_data.append({
+                    "id": "gpt-oss-pinned:latest",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "harmony-agent",
+                    "permission": [],
+                    "root": "gpt-oss-pinned:latest",
+                    "parent": None,
+                })
+            resp = {
+                "object": "list",
+                "data": models_data,
+            }
+            body = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if path in ("/", "/health", "/status"):
+            model_name = GLOBAL_STATE.get("model_name", "gpt-oss-pinned:latest")
+            resp = {
+                "status": "online",
+                "agent": "MP Harmony AI Agent",
+                "model": model_name,
+                "port": AGENT_PORT,
+                "tools_count": len(AVAILABLE_TOOLS),
+            }
+            body = json.dumps(resp, indent=2).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        self.send_response(404)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/json")
+        body = b'{"error": "Endpoint not found"}'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def send_sse_ping(self) -> bool:
         """Sends an SSE keep-alive comment line to keep the client read socket alive."""
@@ -900,27 +1327,43 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                 return False
 
     def do_POST(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        path = parsed.path.rstrip("/")
+
         # 1. Voice Interruption / Barge-in Endpoint
-        if self.path == "/v1/abort":
+        if path == "/v1/abort":
             GLOBAL_STATE["abort_event"].set()
             self.send_response(200)
+            self.send_cors_headers()
             self.send_header("Content-Type", "application/json")
+            body = b'{"status":"aborted"}'
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             try:
-                self.wfile.write(b'{"status":"aborted"}')
+                self.wfile.write(body)
             except Exception:
                 pass
             print("\033[1;31m[Barge-In]\033[0m Abort signal triggered via /v1/abort.")
             return
 
-        if self.path != "/v1/chat/completions":
+        if path not in ("/v1/chat/completions", "/chat/completions"):
             self.send_response(404)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            body = b'{"error": "Endpoint not found"}'
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
             return
 
         GLOBAL_STATE["abort_event"].clear()
         content_length = int(self.headers.get("Content-Length", 0))
         data = json.loads(self.rfile.read(content_length).decode("utf-8"))
+
+        is_stream = bool(data.get("stream", True))
 
         messages = data.get("messages", [])
         last_user_msg = ""
@@ -931,16 +1374,18 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
 
         if not last_user_msg:
             self.send_response(400)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            body = b'{"error":"No user message provided"}'
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
             return
 
-        print(f"\n\033[1;35m[Voice Input Heard]\033[0m {last_user_msg}")
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
+        print(f"\n\033[1;35m[Input Received]\033[0m {last_user_msg} (stream={is_stream})")
 
         enc = GLOBAL_STATE["enc"]
         convo = GLOBAL_STATE["convo"]
@@ -951,25 +1396,61 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             with GLOBAL_STATE["lock"]:
                 new_enc, new_convo = init_agent()
                 GLOBAL_STATE["convo"] = new_convo
-            self.send_sse_chunk("Session memory cleared to baseline.")
-            try:
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except Exception:
-                pass
-            self.close_connection = True
+            if is_stream:
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.send_sse_chunk("Session memory cleared to baseline.")
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                self.close_connection = True
+            else:
+                resp = {
+                    "id": "chatcmpl-reset",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Session memory cleared to baseline."},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                }
+                body = json.dumps(resp).encode("utf-8")
+                self.send_response(200)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             return
 
         stop_heartbeat = threading.Event()
+        heartbeat_thread = None
 
-        def heartbeat_worker():
-            while not stop_heartbeat.wait(4.0):
-                if not self.send_sse_ping():
-                    GLOBAL_STATE["abort_event"].set()
-                    break
+        if is_stream:
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
 
-        heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
-        heartbeat_thread.start()
+            def heartbeat_worker():
+                while not stop_heartbeat.wait(4.0):
+                    if not self.send_sse_ping():
+                        GLOBAL_STATE["abort_event"].set()
+                        break
+
+            heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+            heartbeat_thread.start()
 
         try:
             with GLOBAL_STATE["lock"]:
@@ -989,10 +1470,8 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
 
                     print(f"\033[1;30m[Agent Step {step}] Generating...\033[0m")
 
-                    # Channel parser state machine for real-time streaming
                     raw_token_window = []
                     final_channel_active = [False]
-                    sentence_buffer = [""]
 
                     def live_token_callback(piece: str):
                         nonlocal client_alive
@@ -1000,33 +1479,29 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                             return
 
                         raw_token_window.append(piece)
-                        window = "".join(raw_token_window[-12:])
 
-                        # Identify entry into the final user channel
-                        if "final<|message|>" in window or (not final_channel_active[0] and "final" in window and "<|message|>" in piece):
-                            final_channel_active[0] = True
-                            return
+                        if not final_channel_active[0]:
+                            window = "".join(raw_token_window[-12:])
+                            if "final<|message|>" in window or ("final" in window and "<|message|>" in piece):
+                                final_channel_active[0] = True
+                                if "<|message|>" in piece:
+                                    piece = piece.split("<|message|>", 1)[1]
+                                else:
+                                    return
+                            else:
+                                return
 
-                        # Identify exit from channel
-                        if final_channel_active[0] and ("<|end|>" in piece or "<|call|>" in piece):
+                        if "<|end|>" in piece or "<|call|>" in piece or "<|start|>" in piece:
                             final_channel_active[0] = False
-                            return
+                            piece = re.split(r"<\|(?:end|call|start)\|>", piece)[0]
 
-                        # Forward sentence chunks live
-                        if final_channel_active[0]:
-                            clean_piece = re.sub(r"<\|.*?\|>", "", piece)
-                            if clean_piece:
-                                accumulated_speech_chunks.append(clean_piece)
-                                sentence_buffer[0] += clean_piece
-                                while re.search(r"[\.\!\?\n]\s", sentence_buffer[0]):
-                                    m = re.search(r"[\.\!\?\n]\s", sentence_buffer[0])
-                                    idx = m.end()
-                                    chunk_to_send = sentence_buffer[0][:idx]
-                                    sentence_buffer[0] = sentence_buffer[0][idx:]
-                                    if not self.send_sse_chunk(chunk_to_send):
-                                        client_alive = False
-                                        GLOBAL_STATE["abort_event"].set()
-                                        break
+                        clean_piece = re.sub(r"<\|.*?\|>", "", piece)
+                        if clean_piece:
+                            accumulated_speech_chunks.append(clean_piece)
+                            if is_stream:
+                                if not self.send_sse_chunk(clean_piece):
+                                    client_alive = False
+                                    GLOBAL_STATE["abort_event"].set()
 
                     raw_response = stream_ollama_with_callback(
                         prompt_text,
@@ -1034,10 +1509,6 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                         on_token=live_token_callback,
                         stop_event=GLOBAL_STATE["abort_event"],
                     )
-
-                    # Flush any residual text in the buffer
-                    if sentence_buffer[0].strip() and client_alive and not GLOBAL_STATE["abort_event"].is_set():
-                        self.send_sse_chunk(sentence_buffer[0])
 
                     resp_tokens = enc.encode(raw_response, allowed_special="all")
                     parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
@@ -1066,8 +1537,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                     if not tool_called:
                         break
 
-                # If maximum steps reached without a final response, trigger a final summary
-                if client_alive and not GLOBAL_STATE["abort_event"].is_set() and not final_channel_active[0] and not sentence_buffer[0].strip():
+                if client_alive and not GLOBAL_STATE["abort_event"].is_set() and not final_channel_active[0] and not accumulated_speech_chunks:
                     convo.messages.append(Message.from_role_and_content(
                         Role.DEVELOPER,
                         DeveloperContent.new().with_instructions(
@@ -1076,20 +1546,17 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                     ))
                     prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
                     prompt_text = enc.decode(prompt_tokens)
-                    print("\n\033[1;35m[Final Summary Step] Generating voice reply...\033[0m")
+                    print("\n\033[1;35m[Final Summary Step] Generating reply...\033[0m")
                     raw_response = stream_ollama_with_callback(
                         prompt_text,
                         model_name,
                         on_token=live_token_callback,
                         stop_event=GLOBAL_STATE["abort_event"],
                     )
-                    if sentence_buffer[0].strip() and client_alive and not GLOBAL_STATE["abort_event"].is_set():
-                        self.send_sse_chunk(sentence_buffer[0])
                     resp_tokens = enc.encode(raw_response, allowed_special="all")
                     parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
                     convo.messages.extend(parsed_messages)
 
-                # Automatic speech archiving of assistant voice reply
                 speech_to_save = "".join(accumulated_speech_chunks).strip()
                 if not speech_to_save:
                     speech_parts = []
@@ -1099,24 +1566,81 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                             if pt:
                                 speech_parts.append(pt)
                     speech_to_save = "\n\n".join(speech_parts).strip()
+                if not speech_to_save:
+                    for msg in reversed(parsed_messages):
+                        if getattr(msg, "role", None) == Role.ASSISTANT:
+                            pt = extract_content_text(msg).strip()
+                            if pt:
+                                speech_to_save = pt
+                                break
+
+                # Ensure stream gets the speech if live tokens were missed by edge parser
+                if is_stream and not accumulated_speech_chunks and speech_to_save and client_alive and not GLOBAL_STATE["abort_event"].is_set():
+                    self.send_sse_chunk(speech_to_save)
 
                 if speech_to_save and not GLOBAL_STATE["abort_event"].is_set():
                     auto_archive_speech(speech_to_save)
+
+                if not is_stream:
+                    resp_json = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": speech_to_save,
+                                },
+                                "finish_reason": "stop"
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 0,
+                            "completion_tokens": 0,
+                            "total_tokens": 0,
+                        }
+                    }
+                    body = json.dumps(resp_json).encode("utf-8")
+                    self.send_response(200)
+                    self.send_cors_headers()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
         except Exception as e:
             print(f"\n\033[1;31m[Agent Error]\033[0m {e}")
-            self.send_sse_chunk(f"An error occurred: {e}")
+            if is_stream:
+                self.send_sse_chunk(f"An error occurred: {e}")
+            else:
+                err_resp = {"error": {"message": str(e), "type": "agent_error"}}
+                body = json.dumps(err_resp).encode("utf-8")
+                self.send_response(500)
+                self.send_cors_headers()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except Exception:
+                    pass
         finally:
-            stop_heartbeat.set()
-            try:
-                heartbeat_thread.join(timeout=1.0)
-            except Exception:
-                pass
-            try:
-                with self.write_lock:
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            if is_stream:
+                stop_heartbeat.set()
+                if heartbeat_thread is not None:
+                    try:
+                        heartbeat_thread.join(timeout=1.0)
+                    except Exception:
+                        pass
+                try:
+                    with self.write_lock:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             self.close_connection = True
 
 
