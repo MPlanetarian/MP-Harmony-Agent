@@ -110,3 +110,38 @@ NUM_CTX = 8192          # Agent context limit
 NUM_PREDICT = 4096      # Token generation ceiling
 PRUNE_THRESHOLD = 6000  # Conversation token threshold before FIFO pruning
 SAFE_MODE = True        # Destructive bash pattern guardrails
+
+RUN COMMANDS:
+
+RUN COMMANDS:
+mplanetarian@X299ROG:~/OpenAI/MP_Harmony_Agent$ python ~/OpenAI/MP_Harmony_Agent/MP_Harmony_Agent.py --server gpt-oss-pinned:latest
+======================================================================
+   OpenAI Harmony Advanced Autonomous Engineering Agent
+======================================================================
+ Model Tag         : gpt-oss-pinned:latest
+ Architecture      : GPTOSS | 20.9B | unknown
+ Native Context    : 131,072 tokens
+ Tools Active      : 16 registered (diff, telemetry, jobs, memory, git, web)
+ Guardrails        : safe_mode=ON | auto-pruner=6000 tok
+----------------------------------------------------------------------
+[Voice Bridge Active] Listening at http://127.0.0.1:11435/v1/chat/completions
+[Abort Endpoint] POST http://127.0.0.1:11435/v1/abort
+======================================================================
+
+mplanetarian@X299ROG:/var/home/mplanetarian/voice-ai$ OLLAMA_URL="http://127.0.0.1:11435" local-voice-talk --model gpt-oss-pinned:latest
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Local Voice AI Assistant                                                                                    │
+│ Ollama Endpoint: http://127.0.0.1:11435                                                                     │
+│ LLM Model: gpt-oss-pinned:latest                                                                            │
+│ Whisper STT: base.en (cuda/float16)                                                                         │
+│ Voice TTS: en_GB-jenny_dioco-medium (Mode: piper, Speed: 1.0x)                                              │
+│ Speech Output: ON                                                                                           │
+│ Controls: Press  to record / stop | Type text directly                                                      │
+│ Commands: /voice, /speed, /model, /tts, /clear, /quit                                                       │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+Loading Whisper STT model...
+✓ Whisper STT initialized on GPU
+
+Voice conversation ready!
+
+[Press Enter to Speak | Type text | /quit]:
