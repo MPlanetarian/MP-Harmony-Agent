@@ -31,6 +31,7 @@ AGENT_PORT = 11435
 NUM_CTX = 8192
 NUM_PREDICT = 4096
 PRUNE_THRESHOLD = 6000
+MAX_STEPS = 16
 SAFE_MODE = True
 MEMORY_FILE = os.path.expanduser("~/.harmony_memory.json")
 JOBS_DIR = "/tmp/ha_jobs"
@@ -135,25 +136,95 @@ def patch_file(filepath: str, old_str: str, new_str: str, **kwargs) -> dict:
         return {"error": str(e)}
 
 
+def apply_unified_diff(orig_content: str, diff_text: str) -> tuple:
+    """Applies a unified diff patch to a string in pure Python without external patch utility."""
+    lines = orig_content.splitlines(keepends=True)
+    diff_lines = diff_text.splitlines(keepends=True)
+
+    hunks = []
+    current_hunk = None
+    for line in diff_lines:
+        if line.startswith("@@"):
+            if current_hunk:
+                hunks.append(current_hunk)
+            current_hunk = [line]
+        elif current_hunk is not None:
+            current_hunk.append(line)
+    if current_hunk:
+        hunks.append(current_hunk)
+
+    if not hunks:
+        return False, "No unified diff hunks found in patch."
+
+    for hunk in hunks:
+        header = hunk[0]
+        m = re.match(r"@@\s*-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s*@@", header)
+        old_start = int(m.group(1)) - 1 if m else 0
+
+        old_slice = []
+        new_slice = []
+        for line in hunk[1:]:
+            if line.startswith("-"):
+                old_slice.append(line[1:])
+            elif line.startswith("+"):
+                new_slice.append(line[1:])
+            elif line.startswith(" ") or line == "\n":
+                content = line[1:] if line.startswith(" ") else line
+                old_slice.append(content)
+                new_slice.append(content)
+
+        window = len(old_slice)
+        found_idx = -1
+        old_stripped = [l.rstrip("\r\n") for l in old_slice]
+
+        if 0 <= old_start <= len(lines) - window and [l.rstrip("\r\n") for l in lines[old_start:old_start + window]] == old_stripped:
+            found_idx = old_start
+        else:
+            for i in range(len(lines) - window + 1):
+                if [l.rstrip("\r\n") for l in lines[i:i + window]] == old_stripped:
+                    found_idx = i
+                    break
+
+        if found_idx == -1:
+            return False, f"Could not match hunk context: {header.strip()}"
+
+        lines[found_idx:found_idx + window] = new_slice
+
+    return True, "".join(lines)
+
+
 def patch_file_diff(filepath: str, diff_patch: str, **kwargs) -> dict:
-    """Applies a standard unified diff patch to a target file via patch."""
+    """Applies a standard unified diff patch to a target file via patch or pure Python fallback."""
     try:
         path = os.path.expanduser(filepath)
         if not os.path.exists(path):
             return {"error": f"File does not exist: {path}"}
         backup = f"{path}.bak"
         shutil.copy2(path, backup)
-        proc = subprocess.run(
-            ["patch", "-u", path],
-            input=diff_patch,
-            text=True,
-            capture_output=True,
-            timeout=15,
-        )
-        if proc.returncode != 0:
+
+        if shutil.which("patch"):
+            proc = subprocess.run(
+                ["patch", "-u", path],
+                input=diff_patch,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            if proc.returncode != 0:
+                shutil.copy2(backup, path)
+                return {"error": f"Patch failed: {proc.stderr or proc.stdout}. File restored."}
+            return {"filepath": path, "status": "unified diff applied via patch", "backup": backup}
+
+        # Fallback to pure Python unified diff applier
+        with open(path, "r", encoding="utf-8") as f:
+            orig = f.read()
+        success, patched_or_err = apply_unified_diff(orig, diff_patch)
+        if not success:
             shutil.copy2(backup, path)
-            return {"error": f"Patch failed: {proc.stderr or proc.stdout}. File restored."}
-        return {"filepath": path, "status": "unified diff applied", "backup": backup}
+            return {"error": f"Unified diff failed ({patched_or_err}). Suggestion: Use 'patch_file' with exact string replacement."}
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(patched_or_err)
+        return {"filepath": path, "status": "unified diff applied via pure python", "backup": backup}
     except Exception as e:
         return {"error": str(e)}
 
@@ -331,6 +402,24 @@ AVAILABLE_TOOLS = {
 }
 
 
+def resolve_filepath(filepath: str) -> str:
+    """Normalizes file paths, resolving omitted leading slashes, user tildes, and home-relative paths."""
+    if not filepath or not isinstance(filepath, str):
+        return filepath
+    s = filepath.strip()
+    path = os.path.expanduser(s)
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    # Check if leading slash was dropped (e.g. "var/home/..." -> "/var/home/...")
+    if not s.startswith("/") and os.path.exists("/" + s):
+        return os.path.abspath("/" + s)
+    # Check if relative to user home directory
+    home_rel = os.path.join(os.path.expanduser("~"), s)
+    if os.path.exists(home_rel):
+        return os.path.abspath(home_rel)
+    return path
+
+
 def dispatch_tool(func_name: str, kwargs: dict) -> dict:
     """Safely executes a registered tool with argument normalization, signature filtering, and error isolation."""
     if func_name not in AVAILABLE_TOOLS:
@@ -342,6 +431,11 @@ def dispatch_tool(func_name: str, kwargs: dict) -> dict:
             if alias in kwargs:
                 kwargs["filepath"] = kwargs[alias]
                 break
+
+    if "filepath" in kwargs and isinstance(kwargs["filepath"], str):
+        kwargs["filepath"] = resolve_filepath(kwargs["filepath"])
+    if "repo_path" in kwargs and isinstance(kwargs["repo_path"], str):
+        kwargs["repo_path"] = resolve_filepath(kwargs["repo_path"])
 
     if "command" not in kwargs and "cmd" in kwargs:
         kwargs["command"] = kwargs["cmd"]
@@ -670,7 +764,7 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                 step = 0
                 client_alive = True
 
-                while step < 8 and client_alive:
+                while step < MAX_STEPS and client_alive:
                     if GLOBAL_STATE["abort_event"].is_set():
                         break
                     step += 1
@@ -754,6 +848,29 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
 
                     if not tool_called:
                         break
+
+                # If maximum steps reached without a final response, trigger a final summary
+                if client_alive and not GLOBAL_STATE["abort_event"].is_set() and not final_channel_active[0] and not sentence_buffer[0].strip():
+                    convo.messages.append(Message.from_role_and_content(
+                        Role.DEVELOPER,
+                        DeveloperContent.new().with_instructions(
+                            "Maximum tool execution steps reached. You MUST now summarize your actions, results, and findings directly in the final channel for the user."
+                        )
+                    ))
+                    prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+                    prompt_text = enc.decode(prompt_tokens)
+                    print("\n\033[1;35m[Final Summary Step] Generating voice reply...\033[0m")
+                    raw_response = stream_ollama_with_callback(
+                        prompt_text,
+                        model_name,
+                        on_token=live_token_callback,
+                        stop_event=GLOBAL_STATE["abort_event"],
+                    )
+                    if sentence_buffer[0].strip() and client_alive and not GLOBAL_STATE["abort_event"].is_set():
+                        self.send_sse_chunk(sentence_buffer[0])
+                    resp_tokens = enc.encode(raw_response, allowed_special="all")
+                    parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
+                    convo.messages.extend(parsed_messages)
         except Exception as e:
             print(f"\n\033[1;31m[Agent Error]\033[0m {e}")
             self.send_sse_chunk(f"An error occurred: {e}")
@@ -841,7 +958,7 @@ def main():
         convo.messages.append(Message.from_role_and_content(Role.USER, user_input))
 
         step = 0
-        while step < 8:
+        while step < MAX_STEPS:
             step += 1
             prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
             prompt_text = enc.decode(prompt_tokens)
@@ -875,6 +992,21 @@ def main():
 
             if not tool_called:
                 break
+
+        if tool_called and step >= MAX_STEPS:
+            convo.messages.append(Message.from_role_and_content(
+                Role.DEVELOPER,
+                DeveloperContent.new().with_instructions(
+                    "Maximum tool execution steps reached. Please synthesize your findings, actions, and current status directly for the user."
+                )
+            ))
+            prompt_tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
+            prompt_text = enc.decode(prompt_tokens)
+            print("\n\033[1;35m[Final Summary Step] Generating response...\033[0m")
+            raw_response = stream_ollama_with_callback(prompt_text, model_name)
+            resp_tokens = enc.encode(raw_response, allowed_special="all")
+            parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
+            convo.messages.extend(parsed_messages)
 
 
 if __name__ == "__main__":
