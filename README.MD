@@ -1,5 +1,8 @@
 # MP Harmony Agent (`MP_Harmony_Agent.py`)
 
+> 📅 **Last Updated:** October 9, 2026
+
+[![Last Updated](https://img.shields.io/badge/last%20updated-October%209%2C%202026-brightgreen.svg)](#)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OpenAI Harmony](https://img.shields.io/badge/protocol-OpenAI%20Harmony-orange.svg)](https://github.com/openai/harmony)
 [![Ollama](https://img.shields.io/badge/backend-Ollama%20Raw-black.svg)](https://ollama.com/)
