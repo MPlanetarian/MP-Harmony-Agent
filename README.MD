@@ -10,23 +10,47 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OpenAI Harmony](https://img.shields.io/badge/protocol-OpenAI%20Harmony-orange.svg)](https://github.com/openai/harmony)
 [![Ollama](https://img.shields.io/badge/backend-Ollama%20Raw-black.svg)](https://ollama.com/)
+[![Web HUD 2.0](https://img.shields.io/badge/Web%20HUD-2.0%20Mission%20Control-indigo.svg)](#-web-hud-20-mission-control)
+[![Security HITL](https://img.shields.io/badge/HITL-Human--in--the--Loop-red.svg)](#-human-in-the-loop-hitl-security-mode)
+[![Self-Healing](https://img.shields.io/badge/Self--Healing-Syntax%20Verified-success.svg)](#-autonomous-syntax-verification--self-healing)
 [![Open WebUI Compatible](https://img.shields.io/badge/Open%20WebUI-Compatible-emerald.svg)](https://openwebui.com/)
 [![TTS Engine](https://img.shields.io/badge/TTS-Piper%20ONNX-purple.svg)](https://github.com/rhasspy/piper)
 [![Audio Subsystem](https://img.shields.io/badge/audio-PipeWire%20%2F%20WirePlumber-cyan.svg)](https://pipewire.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 
-A local autonomous system administration, scripting, DJ Mix Studio, and research agent powered by the **OpenAI Harmony** specification and **Ollama**. `MP_Harmony_Agent.py` bridges low-level host OS management (file inspection, unified diff patching, regex search, live web search, background job supervision, and shell execution) with DJ mix library intelligence, hands-free voice control via `local-voice-talk`, and full **OpenAI API** compatibility for frontends such as **Open WebUI**.
+A local autonomous system administration, scripting, DJ Mix Studio, and research agent powered by the **OpenAI Harmony** specification and **Ollama**. `MP_Harmony_Agent.py` bridges low-level host OS management (file inspection, unified diff patching, regex search, live web search, background job supervision, and shell execution) with DJ mix library intelligence, hands-free voice control via `local-voice-talk` or Web Speech API, and full **OpenAI API** compatibility for frontends such as **Open WebUI**.
 
 ---
 
 ## 🚀 Highlighted Features & What's New
 
-### 🎛️ Embedded Web HUD Dashboard (`/hud`)
-- **Live Hardware Telemetry:** Real-time host load averages (1, 5, 15m), memory utilization (`free -h`), NVIDIA GPU stats (model, utilization, VRAM usage, temperature), and PipeWire sink volume.
-- **DJ Mix Archive Status:** Real-time storage stats across all configured host drive roots, audio format counts, and newest recorded mixes.
-- **Interactive Chat & Voice Sandbox:** Web console featuring SSE streaming toggle, prompt suggestion chips, and an in-browser **🔊 Speak** button powered by the speech API.
+### ⚡ Parallel Tool Execution & Concurrency
+- **Multi-Worker Execution:** When the model outputs multiple tool calls in a single thought step, calls are dispatched concurrently via `ThreadPoolExecutor` (up to 4 parallel workers).
+- **Deterministic Context Preservation:** Tool execution results are mapped back into their exact original invocation order (`ordered_results`) prior to appending to the conversation history, preserving prompt determinism and reasoning flow.
+
+### 🩺 Autonomous Syntax Verification & Self-Healing
+- **Instant Pre-Validation:** Every file write and patch (`write_file`, `patch_file`, `patch_file_diff`) is automatically analyzed with native syntax checkers:
+  - **Python (`.py`):** Verified using `py_compile`.
+  - **Bash (`.sh`, `.bash`):** Verified using `bash -n`.
+  - **JSON (`.json`):** Verified using `json.loads`.
+- **Closed-Loop Self-Healing:** If a syntax defect or syntax error is identified, the tool response injects a high-priority `syntax_warning: true` with error details and diagnostic remediation guidance (`action_required`), prompting the LLM to autonomously inspect and self-correct the code in its next reasoning step.
+
+### 🧠 Lossless Hierarchical Context Memory Retention
+- **Intelligent Milestone Retention:** Replaces crude sliding-window message truncations. When active tokens exceed `HARMONY_PRUNE_THRESHOLD`, earlier message history is compressed and retained in a persistent developer guidance block (`[Working Memory of Earlier Pruned Turns]`).
+- **Milestone Continuity:** Retains mission objectives, modified files, running background job IDs, and key system facts across long multi-hour operational sessions without context loss.
+
+### 🎛️ Web HUD 2.0 Mission Control (`/hud`)
+- **Live Canvas Sparklines:** Real-time 60-second hardware telemetry history rendering interactive HTML5 canvas sparklines for Host CPU load average, RAM utilization %, and GPU VRAM %.
+- **Visual Code Diff Inspector:** Dedicated unified diff viewer with colorized syntax highlighting and timestamps, tracking recent file modifications and patches in real time (`/api/recent_diffs`).
+- **Active Background Jobs Manager:** Live monitor and supervision dashboard tracking detached background jobs (`/api/jobs`) with one-click **Stop/Kill** buttons (`POST /api/jobs/stop`).
+- **In-Browser Voice Dictation:** Integrated browser microphone button using the Web Speech API (`webkitSpeechRecognition` / `SpeechRecognition`) with real-time transcription feedback and optional hands-free auto-speak loop upon LLM response.
 - **Audio Archive Player:** Direct in-browser playback of archived assistant speech files alongside full transcripts.
 - Accessible directly at `http://127.0.0.1:11435/` or `http://127.0.0.1:11435/hud`.
+
+### 🛡️ Human-in-the-Loop (HITL) Security Mode
+- **Zero-Trust Guardrails:** Restricts sensitive operations (`run_shell_command`, `write_file`, `patch_file`, `patch_file_diff`, `stop_background_task`, `git_rollback`) until explicit operator approval is granted.
+- **Terminal CLI & Web HUD Approvals:** Operator can review and approve/deny actions directly in the CLI terminal (`[y/N]`) or via the real-time Web HUD Approval Banner.
+- **Dynamic Configuration:** Enable via `--require-approval` CLI argument, `HARMONY_REQUIRE_APPROVAL=1` environment variable, or toggle on/off dynamically via the Web HUD Settings API (`POST /api/settings`).
 
 ### 🌐 Universal OpenAI API & Open WebUI Compatibility
 - **Drop-in OpenAI Endpoint:** Point any standard OpenAI client or **Open WebUI** to `http://127.0.0.1:11435/v1`.
@@ -57,30 +81,29 @@ A local autonomous system administration, scripting, DJ Mix Studio, and research
 ### ⚡ Performance & Connection Pooling
 - **Ollama Connection Pooling:** Persistent `httpx.Client` pool with HTTP keep-alive limits to minimize connection setup latency.
 - **Anti-Repetition Circuit Breaker:** Detects degenerate cyclic n-gram repetition loops and terminates the turn early.
-- **Sliding-Window Context Pruning:** FIFO token pruning with permanently pinned system and developer prompts to keep inference within configured token ceilings.
 - **Multi-Session Isolation:** Sessions tracked via `X-Session-Id` with automatic 24-hour LRU garbage collection.
 
 ---
 
 ## 🛠️ Complete Tool Engine (26 Registered Tools)
 
-| Tool | Category | Description & Behavior | Safeguards |
+| Tool | Category | Description & Behavior | Safeguards & Capabilities |
 | :--- | :--- | :--- | :--- |
 | `read_file` | Filesystem | Reads whole file content (<64KB) or targeted line range | 64 KB limit for whole file |
 | `read_file_lines` | Filesystem | Reads targeted line range with 1-based line numbers | Capped at 250 lines per call |
 | `search_file_regex` | Filesystem | Case-insensitive regex scan across massive files | Max result caps, line numbers |
-| `write_file` | Filesystem | Writes or overwrites scripts/files on disk | Creates `.bak` backup; auto `chmod +x` on `.sh` |
-| `patch_file` | Filesystem | Performs exact string replacement | Creates `.bak` backup; verifies presence |
-| `patch_file_diff` | Filesystem | Applies standard unified diff patches | Uses `patch -u` with pure Python fallback; `.bak` |
+| `write_file` | Filesystem | Writes or overwrites scripts/files on disk | Creates `.bak` backup; auto `chmod +x` on `.sh`; **Syntax verification (`py_compile`/`bash -n`/`json`)**; **Diff recording**; **HITL approval** |
+| `patch_file` | Filesystem | Performs exact string replacement | Creates `.bak` backup; verifies presence; **Syntax verification**; **Diff recording**; **HITL approval** |
+| `patch_file_diff` | Filesystem | Applies standard unified diff patches | Uses `patch -u` with pure Python fallback; `.bak` backup; **Syntax verification**; **Diff recording**; **HITL approval** |
 | `list_directory` | Filesystem | Lists entries with types, sizes (KB), and timestamps | Capped results; filters hidden files |
-| `run_shell_command` | Process | Executes short Bash commands in foreground | 30s timeout; blocked by `SAFE_MODE` |
-| `start_background_task`| Process | Spawns long-running detached background jobs | Returns `job_id`, tracks PID and logs |
+| `run_shell_command` | Process | Executes short Bash commands in foreground | 30s timeout; blocked by `SAFE_MODE`; **HITL approval** |
+| `start_background_task`| Process | Spawns long-running detached background jobs | Returns `job_id`, tracks PID and logs; listed in Web HUD |
 | `check_background_task`| Process | Inspects status and log tail of background tasks | Tails recent lines; verifies active PID |
-| `stop_background_task` | Process | Terminates running background job process group | Sends SIGTERM to PID process group |
-| `get_system_telemetry` | Telemetry | Reads CPU load, host RAM, and NVIDIA GPU metrics | Graceful fallbacks if GPU is absent |
+| `stop_background_task` | Process | Terminates running background job process group | Sends SIGTERM to PID process group; **HITL approval**; one-click Web HUD stop |
+| `get_system_telemetry` | Telemetry | Reads CPU load, host RAM, and NVIDIA GPU metrics | Graceful fallbacks if GPU is absent; live HUD sparklines |
 | `system_audio_volume` | Telemetry | Inspects/controls host volume via PipeWire (`wpctl`) | Supports `status`, `set` (0-150%), `toggle_mute` |
 | `git_checkpoint` | Git | Creates safety commit tag or stash in a repository | Auto-tags with timestamp checkpoint |
-| `git_rollback` | Git | Reverts repository changes back to `HEAD~1` | Hard reset rollback to previous commit |
+| `git_rollback` | Git | Reverts repository changes back to `HEAD~1` | Hard reset rollback to previous commit; **HITL approval** |
 | `set_agent_memory` | Memory | Saves persistent key-value configuration facts | Persisted to `~/.harmony_memory.json` |
 | `get_agent_memory` | Memory | Retrieves a saved persistent memory by key | Returns saved value or null |
 | `list_agent_memories` | Memory | Lists all stored persistent configuration facts | JSON map of all stored keys |
@@ -95,25 +118,31 @@ A local autonomous system administration, scripting, DJ Mix Studio, and research
 
 ---
 
-## 🖥️ Web HUD Dashboard
+## 🖥️ Web HUD 2.0 Mission Control
 
 The Web HUD runs automatically alongside the server at `http://127.0.0.1:11435/`:
 
 ```text
-┌────────────────────────────────────────────────────────────────────────┐
-│  MP Harmony AI Agent • Engineering & Music Hub            [● ONLINE]  │
-├───────────────────────────────────┬────────────────────────────────────┤
-│ HOST & HARDWARE TELEMETRY         │ DJ MIX ARCHIVE STATUS              │
-│ Load Avg: 0.42, 0.58, 0.65        │ Archive Roots: 4 configured roots  │
-│ Memory: 18.2G / 64G               │ Total Files: 1,420 audio mixes     │
-│ GPU: RTX 3090 (42°C, 12% Util)    │ Total Storage: 840 GB              │
-│ VRAM: 4,120 MB / 24,576 MB        │ Formats: FLAC: 980 | MP3: 440      │
-├───────────────────────────────────┴────────────────────────────────────┤
-│ INTERACTIVE CHAT & VOICE SANDBOX  │ AUDIO SPEECH ARCHIVE               │
-│ [ Chat Output Stream & Tools ]    │ [ agent_speech_20261008.wav ] ▶    │
-│ [ Prompt Input Area          ]    │ Transcript: "Found 12 mixes..."    │
-│ [ Stream: ✓ ] [ 🔊 Speak ]        │ [ agent_speech_20261007.wav ] ▶    │
-└───────────────────────────────────┴────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│  MP Harmony AI Agent • Mission Control 2.0        [● ONLINE]  [🛡️ APPROVAL MODE: ON]  │
+├───────────────────────────────────────────┬────────────────────────────────────────────┤
+│ HOST & HARDWARE TELEMETRY SPARKLINE       │ ACTIVE BACKGROUND JOBS (SUPERVISOR)        │
+│ CPU Load (1m): 0.42 ▂▃▄▅▆▇ (Canvas)       │ [Job #3821] python worker.py (Running)     │
+│ Memory: 18.2G / 64G ▃▄▅▆▇                 │ Log: "...listening on queue..."            │
+│ GPU: RTX 3090 (42°C, 12% Util)            │ [⏹️ Stop Job]                              │
+│ VRAM: 4,120 MB / 24,576 MB                │                                            │
+├───────────────────────────────────────────┼────────────────────────────────────────────┤
+│ CODE INSPECTOR & RECENT UNIFIED DIFFS     │ DJ MIX ARCHIVE STATUS                      │
+│ [patch_file_diff] server.py (14:32:01)    │ Archive Roots: 4 configured roots          │
+│ --- a/server.py  +++ b/server.py          │ Total Files: 1,420 audio mixes             │
+│ -    def old_handler():                   │ Storage: 840 GB | FLAC: 980 | MP3: 440     │
+│ +    def safe_handler():                  │                                            │
+├───────────────────────────────────────────┴────────────────────────────────────────────┤
+│ INTERACTIVE CHAT & VOICE SANDBOX          │ AUDIO SPEECH ARCHIVE                       │
+│ [ Chat Output Stream & Parallel Tools ]   │ [ agent_speech_20261009.wav ] ▶            │
+│ [ Prompt Input Area                     ] │ Transcript: "Patched server.py safely..."  │
+│ [ Stream: ✓ ] [🎤 Mic Dictate] [🔊 Speak] │ [ agent_speech_20261008.wav ] ▶            │
+└───────────────────────────────────────────┴────────────────────────────────────────────┘
 ```
 
 ---
@@ -147,8 +176,11 @@ Run directly in your shell for local system scripting and administration:
 # Auto-detects model from Ollama
 python3 MP_Harmony_Agent.py
 
-# Or specify a target model tag explicitly
+# Specify target model tag explicitly
 python3 MP_Harmony_Agent.py gpt-oss-pinned:latest
+
+# Launch with Human-in-the-Loop (HITL) approval mode enabled
+python3 MP_Harmony_Agent.py --require-approval
 ```
 
 **Commands during interactive chat:**
@@ -164,18 +196,27 @@ Launch the OpenAI-compatible HTTP server:
 # Start server on default port 11435
 python3 MP_Harmony_Agent.py --server
 
-# Or specify target model tag
+# Start server with target model tag
 python3 MP_Harmony_Agent.py --server gpt-oss-pinned:latest
+
+# Start server with Human-in-the-Loop (HITL) approval mode enabled
+python3 MP_Harmony_Agent.py --server --require-approval
 ```
 
 The server exposes:
-- **Web HUD Dashboard**: `http://127.0.0.1:11435/`
+- **Web HUD 2.0 Dashboard**: `http://127.0.0.1:11435/` or `http://127.0.0.1:11435/hud`
 - **OpenAI Chat Completions**: `POST http://127.0.0.1:11435/v1/chat/completions`
 - **OpenAI Speech API**: `POST http://127.0.0.1:11435/v1/audio/speech`
 - **Model Discovery**: `GET http://127.0.0.1:11435/v1/models`
 - **Barge-In Abort**: `POST http://127.0.0.1:11435/v1/abort`
 - **Telemetry JSON**: `GET http://127.0.0.1:11435/api/telemetry`
 - **Mix Stats JSON**: `GET http://127.0.0.1:11435/api/mix_stats`
+- **Recent Diffs JSON**: `GET http://127.0.0.1:11435/api/recent_diffs`
+- **Active Background Jobs JSON**: `GET http://127.0.0.1:11435/api/jobs`
+- **Stop Background Job**: `POST http://127.0.0.1:11435/api/jobs/stop`
+- **Pending HITL Approvals**: `GET http://127.0.0.1:11435/api/approvals`
+- **Submit Approval Decision**: `POST http://127.0.0.1:11435/api/approvals/decision`
+- **Runtime Settings API**: `GET /api/settings` and `POST /api/settings`
 - **Audio Serving**: `GET http://127.0.0.1:11435/audio/<filename>`
 
 ---
@@ -195,8 +236,12 @@ You can integrate MP Harmony Agent as a backend provider in **Open WebUI**:
 
 ---
 
-### 4. Hands-Free Voice Control (`local-voice-talk`)
+### 4. Hands-Free Voice Control (`local-voice-talk` & Web HUD Mic)
 
+#### Option A: In-Browser Web Speech Dictation
+Open `http://127.0.0.1:11435/` in Chrome/Edge, click the **🎤 Mic Dictate** button, and speak. Your words stream into the prompt box, ready for submission or hands-free auto-speak!
+
+#### Option B: Terminal `local-voice-talk` Daemon
 Connect `local-voice-talk` directly to the agent's SSE streaming endpoint:
 
 ```bash
@@ -209,13 +254,13 @@ OLLAMA_URL="http://127.0.0.1:11435" local-voice-talk --model mp-harmony-agent
 Microphone (Spoken Input)
    │
    ▼
-[local-voice-talk / Whisper]
+[local-voice-talk / Whisper / Web Speech API]
    │
    ▼ POST /v1/chat/completions (Port 11435)
 [MP_Harmony_Agent Server] ──────────────► [Ollama Raw Engine (Port 11434)]
    │                                              │
-   │◄─── Executes Local / System Tools ───────────┘
-   │     (search_mix_archive, patch_file, telemetry, etc.)
+   │◄─── Concurrent Multi-Tool Dispatch ──────────┘
+   │     (write_file + verify_file_syntax, telemetry, etc.)
    │
    ▼ Sentence-Buffered SSE Stream (msg.channel == "final")
 [local-voice-talk / Piper TTS]
@@ -232,7 +277,7 @@ Speakers / Audio Output (Immediate sentence-by-sentence playback)
 ## 📺 Live Console Session
 
 ```text
-$ python ~/OpenAI/MP_Harmony_Agent/MP_Harmony_Agent.py --server gpt-oss-pinned:latest
+$ python ~/OpenAI/MP_Harmony_Agent/MP_Harmony_Agent.py --server --require-approval gpt-oss-pinned:latest
 ======================================================================
    OpenAI Harmony Advanced Autonomous Engineering Agent
 ======================================================================
@@ -241,10 +286,11 @@ $ python ~/OpenAI/MP_Harmony_Agent/MP_Harmony_Agent.py --server gpt-oss-pinned:l
  Native Context    : 131,072 tokens
  Tools Active      : 26 registered (diff, telemetry, jobs, memory, git, web, audio)
  Audio Archive     : /var/home/mplanetarian/OpenAI/MP_Harmony_Agent/audio_responses (auto-archive: ON)
- Guardrails        : safe_mode=ON | auto-pruner=3200 tok
+ Guardrails        : safe_mode=ON | approval_mode=ON | parallel_exec=ON | auto-pruner=3200 tok
 ----------------------------------------------------------------------
 [Voice Bridge Active] Listening at http://127.0.0.1:11435/v1/chat/completions
-[Abort Endpoint] POST http://127.0.0.1:11435/v1/abort
+[Web HUD 2.0]         http://127.0.0.1:11435/hud
+[Abort Endpoint]      POST http://127.0.0.1:11435/v1/abort
 ======================================================================
 
 $ OLLAMA_URL="http://127.0.0.1:11435" local-voice-talk --model mp-harmony-agent
@@ -276,9 +322,10 @@ Tune runtime settings using environment variables:
 | :--- | :--- | :--- |
 | `HARMONY_AGENT_PORT` | `11435` | HTTP server listening port |
 | `HARMONY_MODEL` | Auto-detected | Ollama model tag (overrides auto-detection) |
+| `HARMONY_REQUIRE_APPROVAL` | `0` | Enable Human-in-the-Loop (HITL) approval mode (`1` or `0`) |
 | `HARMONY_NUM_CTX` | `4096` | Context window token ceiling |
 | `HARMONY_NUM_PREDICT` | `2048` | Maximum tokens generated per step |
-| `HARMONY_PRUNE_THRESHOLD` | `3200` | Token limit triggering FIFO sliding-window pruning |
+| `HARMONY_PRUNE_THRESHOLD` | `3200` | Token limit triggering hierarchical sliding-window pruning |
 | `HARMONY_MAX_STEPS` | `16` | Maximum autonomous tool execution steps per user turn |
 | `HARMONY_AUDIO_DIR` | `./audio_responses` | Destination directory for archived speech `.wav` and `.txt` |
 | `HARMONY_AUTO_ARCHIVE_AUDIO` | `1` | Enable/disable automatic background TTS archiving (`1` or `0`) |
@@ -289,6 +336,10 @@ Tune runtime settings using environment variables:
 ## 🛡️ Architecture & Safety Guardrails
 
 - **Enforced Action over Chat:** Developer instructions direct the model to apply changes directly via tools instead of outputting raw Markdown code blocks for manual copying.
+- **Autonomous Pre-Commit Syntax Validation:** Validates Python (`py_compile`), Bash (`bash -n`), and JSON (`json.loads`) after writes and patches. If syntax errors occur, the tool alerts the model with exact line diagnostics to immediately self-heal.
+- **Human-in-the-Loop (HITL) Approvals:** Modifying or executing system operations require affirmative confirmation (`[y/N]` in CLI, or one-click Approve/Deny in Web HUD 2.0).
+- **Parallel Determinism:** Concurrent tool dispatch via `ThreadPoolExecutor` ensures that all results return in deterministic, predictable message order.
+- **Hierarchical Memory Retention:** Never blindly discards historical context during pruning; milestones, jobs, and modified file paths are synthesized into pinned developer working memory.
 - **Automatic File Backups:** File-writing tools (`write_file`, `patch_file`, `patch_file_diff`) create timestamped `.bak` files before altering files on disk.
 - **Safe Mode Inspection:** Blocks shell commands matching dangerous patterns (`rm -rf`, `mkfs`, `dd if=`, `shutdown`, `reboot`, `git reset --hard`).
 - **Connection Pooling:** Uses persistent `httpx.Client` connection pools with keep-alive limits to communicate with Ollama with minimal latency overhead.

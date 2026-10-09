@@ -14,6 +14,8 @@ import wave
 import queue
 import io
 import urllib.parse
+import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import httpx
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from openai_harmony import (
@@ -48,12 +50,78 @@ AUDIO_OUTPUT_DIR = os.path.expanduser(
 AUDIO_AUTO_ARCHIVE = os.getenv("HARMONY_AUTO_ARCHIVE_AUDIO", "1").lower() not in ("0", "false", "no")
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
+REQUIRE_APPROVAL = os.getenv("HARMONY_REQUIRE_APPROVAL", "0").lower() in ("1", "true", "yes")
+_RECENT_DIFFS = []
+_DIFF_LOCK = threading.Lock()
+_PENDING_APPROVALS = {}
+_APPROVAL_LOCK = threading.Lock()
+
 # Persistent Ollama HTTP connection pool
 _OLLAMA_CLIENT = httpx.Client(
     base_url="http://localhost:11434",
     timeout=httpx.Timeout(300.0, connect=10.0),
     limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
 )
+
+
+def verify_file_syntax(filepath: str) -> tuple[bool, str]:
+    """Autonomous syntax verification for Python, Bash, and JSON."""
+    try:
+        path = os.path.abspath(os.path.expanduser(filepath))
+        if not os.path.exists(path):
+            return True, ""
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".py":
+            res = subprocess.run([sys.executable, "-m", "py_compile", path], capture_output=True, text=True, timeout=8)
+            if res.returncode != 0:
+                err = res.stderr.strip() or res.stdout.strip()
+                return False, f"Python syntax compilation error: {err}"
+        elif ext in (".sh", ".bash"):
+            if shutil.which("bash"):
+                res = subprocess.run(["bash", "-n", path], capture_output=True, text=True, timeout=8)
+                if res.returncode != 0:
+                    err = res.stderr.strip() or res.stdout.strip()
+                    return False, f"Bash syntax error: {err}"
+        elif ext == ".json":
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except Exception as e:
+                return False, f"JSON parsing error: {e}"
+        return True, ""
+    except Exception:
+        return True, ""
+
+
+def record_file_diff(filepath: str, old_content: str, new_content: str, backup_path: str = None) -> str:
+    """Computes and stores unified diff in memory for Web HUD and audit history."""
+    try:
+        old_lines = (old_content or "").splitlines(keepends=True)
+        new_lines = (new_content or "").splitlines(keepends=True)
+        diff_lines = list(difflib.unified_diff(
+            old_lines, new_lines,
+            fromfile=f"a/{os.path.basename(filepath)}",
+            tofile=f"b/{os.path.basename(filepath)}",
+            n=3
+        ))
+        diff_text = "".join(diff_lines)
+        if diff_text:
+            entry = {
+                "id": str(uuid.uuid4())[:8],
+                "filepath": filepath,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "diff": diff_text,
+                "backup": backup_path,
+                "lines_added": sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++")),
+                "lines_removed": sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("---")),
+            }
+            with _DIFF_LOCK:
+                _RECENT_DIFFS.insert(0, entry)
+                if len(_RECENT_DIFFS) > 30:
+                    _RECENT_DIFFS.pop()
+        return diff_text
+    except Exception:
+        return ""
 
 # ---------------------------------------------------------------------------
 # 1. Local Tools Implementation
@@ -115,28 +183,41 @@ def search_file_regex(filepath: str, pattern: str, max_results: int = 15, **kwar
 
 
 def write_file(filepath: str, content: str, **kwargs) -> dict:
-    """Overwrites or creates a file with automatic .bak backup."""
+    """Overwrites or creates a file with automatic .bak backup and syntax self-check."""
     try:
         path = os.path.expanduser(filepath)
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         backup = None
+        orig_content = ""
         if os.path.exists(path):
             backup = f"{path}.bak"
             shutil.copy2(path, backup)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    orig_content = f.read()
+            except Exception:
+                pass
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
         if path.endswith(".sh"):
             os.chmod(path, 0o755)
+
+        record_file_diff(path, orig_content, content, backup)
         res = {"filepath": path, "status": "written successfully", "bytes": len(content)}
         if backup:
             res["backup"] = backup
+
+        ok, syntax_err = verify_file_syntax(path)
+        if not ok:
+            res["syntax_warning"] = syntax_err
+            res["action_required"] = f"CRITICAL: Syntax verification failed on {path}. Inspect line and immediately self-heal/patch the error."
         return res
     except Exception as e:
         return {"error": str(e)}
 
 
 def patch_file(filepath: str, old_str: str, new_str: str, **kwargs) -> dict:
-    """Exact string replacement with .bak backup."""
+    """Exact string replacement with .bak backup and syntax self-check."""
     try:
         path = os.path.expanduser(filepath)
         if not os.path.exists(path):
@@ -147,9 +228,18 @@ def patch_file(filepath: str, old_str: str, new_str: str, **kwargs) -> dict:
             return {"error": "Exact target string not found in file."}
         backup = f"{path}.bak"
         shutil.copy2(path, backup)
+        new_content = orig.replace(old_str, new_str, 1)
         with open(path, "w", encoding="utf-8") as f:
-            f.write(orig.replace(old_str, new_str, 1))
-        return {"filepath": path, "status": "patched successfully", "backup": backup}
+            f.write(new_content)
+
+        record_file_diff(path, orig, new_content, backup)
+        res = {"filepath": path, "status": "patched successfully", "backup": backup}
+
+        ok, syntax_err = verify_file_syntax(path)
+        if not ok:
+            res["syntax_warning"] = syntax_err
+            res["action_required"] = f"CRITICAL: Syntax verification failed on {path}. Inspect line and immediately self-heal/patch the error."
+        return res
     except Exception as e:
         return {"error": str(e)}
 
@@ -220,6 +310,7 @@ def patch_file_diff(filepath: str, diff_patch: str, **kwargs) -> dict:
         backup = f"{path}.bak"
         shutil.copy2(path, backup)
 
+        new_content = ""
         if shutil.which("patch"):
             proc = subprocess.run(
                 ["patch", "-u", path],
@@ -231,18 +322,37 @@ def patch_file_diff(filepath: str, diff_patch: str, **kwargs) -> dict:
             if proc.returncode != 0:
                 shutil.copy2(backup, path)
                 return {"error": f"Patch failed: {proc.stderr or proc.stdout}. File restored."}
-            return {"filepath": path, "status": "unified diff applied via patch", "backup": backup}
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as nf:
+                    new_content = nf.read()
+            except Exception:
+                pass
+            res = {"filepath": path, "status": "unified diff applied via patch", "backup": backup}
+        else:
+            # Fallback to pure Python unified diff applier
+            with open(path, "r", encoding="utf-8") as f:
+                orig = f.read()
+            success, patched_or_err = apply_unified_diff(orig, diff_patch)
+            if not success:
+                shutil.copy2(backup, path)
+                return {"error": f"Unified diff failed ({patched_or_err}). Suggestion: Use 'patch_file' with exact string replacement."}
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(patched_or_err)
+            new_content = patched_or_err
+            res = {"filepath": path, "status": "unified diff applied via pure python", "backup": backup}
 
-        # Fallback to pure Python unified diff applier
-        with open(path, "r", encoding="utf-8") as f:
-            orig = f.read()
-        success, patched_or_err = apply_unified_diff(orig, diff_patch)
-        if not success:
-            shutil.copy2(backup, path)
-            return {"error": f"Unified diff failed ({patched_or_err}). Suggestion: Use 'patch_file' with exact string replacement."}
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(patched_or_err)
-        return {"filepath": path, "status": "unified diff applied via pure python", "backup": backup}
+        try:
+            with open(backup, "r", encoding="utf-8", errors="replace") as bf:
+                orig_content = bf.read()
+        except Exception:
+            orig_content = ""
+
+        record_file_diff(path, orig_content, new_content, backup)
+        ok, syntax_err = verify_file_syntax(path)
+        if not ok:
+            res["syntax_warning"] = syntax_err
+            res["action_required"] = f"CRITICAL: Syntax verification failed on {path}. Inspect line and immediately self-heal/patch the error."
+        return res
     except Exception as e:
         return {"error": str(e)}
 
@@ -1259,6 +1369,46 @@ def dispatch_tool(func_name: str, kwargs: dict) -> dict:
                 kwargs["target"] = kwargs[alias]
                 break
 
+    # Human-in-the-Loop (HITL) approval check
+    sensitive_tools = {
+        "run_shell_command",
+        "git_rollback",
+        "stop_background_task",
+        "write_file",
+        "patch_file",
+        "patch_file_diff",
+    }
+    if REQUIRE_APPROVAL and func_name in sensitive_tools:
+        if sys.stdin and sys.stdin.isatty():
+            print(f"\n\033[1;31m[HUMAN APPROVAL REQUIRED]\033[0m")
+            print(f"Tool    : \033[1;33m{func_name}\033[0m")
+            print(f"Payload : \033[1;30m{json.dumps(kwargs, indent=2)}\033[0m")
+            try:
+                ans = input("Authorize tool execution? [y/N]: ").strip().lower()
+                if ans not in ("y", "yes"):
+                    return {"error": f"Operator denied execution of '{func_name}'."}
+            except Exception:
+                return {"error": f"Failed to acquire operator input for '{func_name}'."}
+        else:
+            approval_id = str(uuid.uuid4())[:8]
+            entry = {
+                "id": approval_id,
+                "tool": func_name,
+                "kwargs": kwargs,
+                "time": time.time(),
+                "status": "pending",
+                "event": threading.Event(),
+            }
+            with _APPROVAL_LOCK:
+                _PENDING_APPROVALS[approval_id] = entry
+            print(f"\n\033[1;31m[HITL Awaiting Web Approval]\033[0m {func_name} (ID: {approval_id})")
+            approved = entry["event"].wait(timeout=35.0)
+            with _APPROVAL_LOCK:
+                status = entry.get("status")
+                _PENDING_APPROVALS.pop(approval_id, None)
+            if not approved or status != "approved":
+                return {"error": f"Operator did not approve tool '{func_name}' in time (or rejected action)."}
+
     func = AVAILABLE_TOOLS[func_name]
     try:
         return func(**kwargs)
@@ -1343,22 +1493,45 @@ def prune_conversation_if_needed(convo: Conversation, enc) -> int:
     pruned = 0
     excess = current - PRUNE_THRESHOLD
     est_to_drop = max(2, min(len(convo.messages) - (pinned + 2), excess // 160))
+
+    # Hierarchical context retention: extract key milestones from dropped messages
+    dropped_summaries = []
     for _ in range(est_to_drop):
         if len(convo.messages) > (pinned + 2):
-            convo.messages.pop(pinned)
+            msg = convo.messages.pop(pinned)
             pruned += 1
+            role_name = getattr(msg, "role", None)
+            text_snippet = extract_content_text(msg).strip()
+            if text_snippet:
+                if role_name == Role.USER:
+                    dropped_summaries.append(f"User requested: {text_snippet[:140]}")
+                elif getattr(msg, "recipient", None) and msg.recipient.startswith("functions."):
+                    func = msg.recipient.split("functions.", 1)[1]
+                    dropped_summaries.append(f"Tool executed: {func}")
+                elif role_name == Role.ASSISTANT and getattr(msg, "channel", None) == "final":
+                    dropped_summaries.append(f"Agent summary: {text_snippet[:140]}")
 
     tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
     current = len(tokens)
 
     while current > PRUNE_THRESHOLD and len(convo.messages) > (pinned + 2):
-        convo.messages.pop(pinned)
+        msg = convo.messages.pop(pinned)
         pruned += 1
         tokens = enc.render_conversation_for_completion(convo, Role.ASSISTANT)
         current = len(tokens)
 
+    if dropped_summaries:
+        mem_text = "\n".join(f"- {s}" for s in dropped_summaries[-6:])
+        summary_msg = Message.from_role_and_content(
+            Role.DEVELOPER,
+            DeveloperContent.new().with_instructions(
+                f"[Working Memory of Earlier Pruned Turns]\n{mem_text}"
+            )
+        )
+        convo.messages.insert(pinned, summary_msg)
+
     if pruned:
-        print(f"\033[1;33m[Context Window]\033[0m Pruned {pruned} messages. Active tokens: {current:,}")
+        print(f"\033[1;33m[Context Window]\033[0m Pruned {pruned} messages with hierarchical summary. Active tokens: {current:,}")
     return current
 
 
@@ -1481,6 +1654,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     --magenta: #d946ef;
     --yellow: #f59e0b;
     --red: #ef4444;
+    --blue: #3b82f6;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1490,7 +1664,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     padding: 24px;
     line-height: 1.5;
   }
-  .container { max-width: 1280px; margin: 0 auto; }
+  .container { max-width: 1340px; margin: 0 auto; }
   header {
     display: flex;
     justify-content: space-between;
@@ -1499,11 +1673,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     gap: 16px;
     padding-bottom: 20px;
     border-bottom: 1px solid var(--card-border);
-    margin-bottom: 24px;
+    margin-bottom: 20px;
   }
   .title-group { display: flex; align-items: center; gap: 14px; }
   .logo {
-    width: 42px; height: 42px; background: linear-gradient(135deg, var(--accent), var(--magenta));
+    width: 44px; height: 44px; background: linear-gradient(135deg, var(--accent), var(--magenta));
     border-radius: 10px; display: flex; align-items: center; justify-content: center;
     font-weight: 900; font-size: 20px; color: #fff; box-shadow: 0 0 16px rgba(56, 189, 248, 0.4);
   }
@@ -1511,61 +1685,92 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badges { display: flex; gap: 8px; flex-wrap: wrap; }
   .badge {
     font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 9999px;
-    display: inline-flex; align-items: center; gap: 6px;
+    display: inline-flex; align-items: center; gap: 6px; user-select: none;
   }
   .badge-online { background: rgba(16, 185, 129, 0.15); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
   .badge-model { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3); }
   .badge-port { background: rgba(217, 70, 239, 0.15); color: var(--magenta); border: 1px solid rgba(217, 70, 239, 0.3); }
+  .badge-hitl { background: rgba(245, 158, 11, 0.15); color: var(--yellow); border: 1px solid rgba(245, 158, 11, 0.3); cursor: pointer; }
+  .badge-hitl.active { background: rgba(239, 68, 68, 0.2); color: var(--red); border-color: rgba(239, 68, 68, 0.4); }
 
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 20px; margin-bottom: 24px; }
+  /* Approval Banner */
+  #approval-banner {
+    display: none; background: #3c1414; border: 1px solid #ef4444; border-radius: 10px;
+    padding: 14px 18px; margin-bottom: 20px; justify-content: space-between; align-items: center;
+    box-shadow: 0 0 18px rgba(239, 68, 68, 0.35); animation: pulseAlert 2s infinite;
+  }
+  @keyframes pulseAlert { 0% { border-color: #ef4444; } 50% { border-color: #f87171; } 100% { border-color: #ef4444; } }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 20px; margin-bottom: 24px; }
   .card {
     background: var(--card); border: 1px solid var(--card-border);
     border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
   }
   .card h2 { font-size: 15px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
-  .telemetry-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 14px; }
+  .telemetry-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.05); font-size: 13px; }
   .telemetry-row:last-child { border-bottom: none; }
   .val { font-weight: 600; color: #fff; font-family: monospace; }
 
   /* Audio player card */
   .audio-item {
     background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border);
-    border-radius: 8px; padding: 12px; margin-bottom: 12px;
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
   }
-  .audio-header { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
-  .audio-transcript { font-size: 13px; color: var(--text); margin-bottom: 8px; font-style: italic; }
-  audio { width: 100%; height: 32px; outline: none; }
+  .audio-header { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .audio-transcript { font-size: 12px; color: var(--text); margin-bottom: 6px; font-style: italic; }
+  audio { width: 100%; height: 28px; outline: none; }
 
   /* Chat Sandbox */
-  .chat-box {
-    display: flex; flex-direction: column; height: 460px;
-  }
+  .chat-box { display: flex; flex-direction: column; height: 460px; }
   .chat-output {
     flex: 1; background: #06090e; border: 1px solid var(--card-border); border-radius: 8px;
-    padding: 14px; overflow-y: auto; font-size: 14px; font-family: monospace; line-height: 1.6;
+    padding: 14px; overflow-y: auto; font-size: 13px; font-family: monospace; line-height: 1.6;
     white-space: pre-wrap; word-break: break-word; color: #e2e8f0; margin-bottom: 12px;
   }
   .input-bar { display: flex; gap: 8px; }
   textarea {
     flex: 1; background: #06090e; border: 1px solid var(--card-border); border-radius: 8px;
-    color: #fff; padding: 10px 14px; font-size: 14px; font-family: inherit; resize: none; height: 50px; outline: none;
+    color: #fff; padding: 10px 14px; font-size: 13px; font-family: inherit; resize: none; height: 48px; outline: none;
   }
   textarea:focus { border-color: var(--accent); }
   button {
     background: var(--accent); color: #000; border: none; font-weight: 600; border-radius: 8px;
-    padding: 0 18px; cursor: pointer; transition: opacity 0.15s; font-size: 14px;
+    padding: 0 16px; cursor: pointer; transition: opacity 0.15s; font-size: 13px;
   }
   button:hover { opacity: 0.9; }
   button.btn-speak { background: var(--magenta); color: #fff; margin-left: 6px; }
   button.btn-stop { background: var(--red); color: #fff; }
-  .actions { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 13px; color: var(--muted); }
+  button.btn-mic { background: var(--blue); color: #fff; margin-left: 4px; }
+  button.btn-mic.recording { background: var(--red); animation: micPulse 1s infinite; }
+  @keyframes micPulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+
+  .actions { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 12px; color: var(--muted); }
   .quick-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
   .chip { background: rgba(56, 189, 248, 0.1); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.2); padding: 3px 8px; border-radius: 6px; font-size: 11px; cursor: pointer; }
   .chip:hover { background: rgba(56, 189, 248, 0.2); }
+
+  /* Diffs and Jobs */
+  .diff-item { background: rgba(255, 255, 255, 0.02); border: 1px solid var(--card-border); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+  .diff-box { background: #06090e; border: 1px solid var(--card-border); border-radius: 6px; padding: 8px; font-family: monospace; font-size: 11px; max-height: 160px; overflow-y: auto; white-space: pre; margin-top: 6px; }
+  .diff-add { color: #10b981; }
+  .diff-del { color: #ef4444; }
+  .job-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--card-border); border-radius: 6px; margin-bottom: 6px; font-size: 12px; }
 </style>
 </head>
 <body>
 <div class="container">
+  <!-- Approval Banner Modal -->
+  <div id="approval-banner">
+    <div>
+      <div style="font-weight:700; color:#fff; font-size:14px;">⚠️ HUMAN APPROVAL REQUIRED FOR SYSTEM ACTION</div>
+      <div id="approval-desc" style="font-size:12px; color:#fca5a5; margin-top:3px; font-family:monospace;">Action payload pending confirmation...</div>
+    </div>
+    <div style="display:flex; gap:8px;">
+      <button style="background:var(--green); color:#fff; padding:6px 14px; font-size:12px;" onclick="respondApproval('approve')">Approve</button>
+      <button style="background:var(--red); color:#fff; padding:6px 14px; font-size:12px;" onclick="respondApproval('deny')">Deny</button>
+    </div>
+  </div>
+
   <header>
     <div class="title-group">
       <div class="logo">H</div>
@@ -1578,6 +1783,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <span class="badge badge-online">● ONLINE</span>
       <span class="badge badge-port">PORT: 11435</span>
       <span class="badge badge-model" id="model-badge">MODEL: gpt-oss-pinned</span>
+      <span class="badge badge-hitl" id="badge-hitl" onclick="toggleHitl()">🛡️ HITL APPROVAL: OFF</span>
     </div>
   </header>
 
@@ -1588,10 +1794,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="telemetry-row"><span>Load Average (1, 5, 15m)</span><span class="val" id="val-load">--</span></div>
       <div class="telemetry-row"><span>Host Memory (RAM)</span><span class="val" id="val-mem">--</span></div>
       <div class="telemetry-row"><span>GPU Hardware</span><span class="val" id="val-gpu-model">--</span></div>
-      <div class="telemetry-row"><span>GPU VRAM</span><span class="val" id="val-gpu-vram">--</span></div>
+      <div class="telemetry-row"><span>GPU VRAM / Temp</span><span class="val" id="val-gpu-vram">--</span></div>
       <div class="telemetry-row"><span>GPU Utilization</span><span class="val" id="val-gpu-util">--</span></div>
-      <div class="telemetry-row"><span>GPU Temperature</span><span class="val" id="val-gpu-temp">--</span></div>
-      <div class="telemetry-row"><span>Audio Sink Volume</span><span class="val" id="val-audio-vol">--</span></div>
+      <div class="telemetry-row"><span>Audio Volume (PipeWire)</span><span class="val" id="val-audio-vol">--</span></div>
+      <canvas id="telemetry-sparkline" width="360" height="60" style="width:100%; height:60px; background:rgba(0,0,0,0.3); border-radius:6px; margin-top:10px;"></canvas>
     </div>
 
     <!-- DJ Mix Studio Card -->
@@ -1601,8 +1807,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="telemetry-row"><span>Total Audio Files</span><span class="val" id="val-mix-total">--</span></div>
       <div class="telemetry-row"><span>Total Storage</span><span class="val" id="val-mix-gb">--</span></div>
       <div class="telemetry-row"><span>Formats</span><span class="val" id="val-mix-formats">--</span></div>
-      <div style="margin-top: 14px; font-size: 13px; font-weight: 600; color: var(--muted);">Latest Mixes:</div>
-      <div id="latest-mixes-list" style="margin-top: 6px; font-size: 12px; color: var(--text);"></div>
+      <div style="margin-top: 10px; font-size: 12px; font-weight: 600; color: var(--muted);">Latest Mixes:</div>
+      <div id="latest-mixes-list" style="margin-top: 4px; font-size: 11px; color: var(--text);"></div>
     </div>
   </div>
 
@@ -1611,32 +1817,54 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card" style="grid-column: span 1;">
       <h2>Interactive Chat & Voice Sandbox</h2>
       <div class="chat-box">
-        <div class="chat-output" id="chat-output">Ready. Type a prompt or click a quick suggestion below...</div>
+        <div class="chat-output" id="chat-output">Ready. Type a prompt, use the 🎤 Voice button, or click suggestions below...</div>
         <div class="input-bar">
-          <textarea id="prompt-input" placeholder="Ask MP Harmony Agent anything (e.g. check tracklist, audio volume, telemetry)..."></textarea>
+          <textarea id="prompt-input" placeholder="Ask MP Harmony Agent anything (e.g. check tracklist, verify code, telemetry)..."></textarea>
           <button id="send-btn" onclick="sendChat()">Send</button>
+          <button id="mic-btn" class="btn-mic" onclick="toggleDictation()" title="Voice Dictation (Web Speech API)">🎤</button>
           <button id="abort-btn" class="btn-stop" style="display:none;" onclick="abortChat()">Abort</button>
         </div>
         <div class="actions">
           <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
-            <input type="checkbox" id="stream-toggle" checked> Stream Response (SSE)
+            <input type="checkbox" id="stream-toggle" checked> Stream SSE
           </label>
-          <button class="btn-speak" id="speak-btn" style="padding:4px 12px; font-size:12px;" onclick="speakResponse()">🔊 Speak</button>
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="checkbox" id="auto-speak-toggle"> 🔊 Hands-Free Voice Reply
+          </label>
+          <button class="btn-speak" id="speak-btn" style="padding:4px 10px; font-size:11px;" onclick="speakResponse()">🔊 Speak</button>
         </div>
         <div class="quick-chips">
           <span class="chip" onclick="quickPrompt('What is the current system audio volume? Use your tool.')">Audio Volume</span>
           <span class="chip" onclick="quickPrompt('Get mix archive stats')">Mix Archive Stats</span>
-          <span class="chip" onclick="quickPrompt('Find track in mixes for Dreamy')">Find 'Dreamy' Tracks</span>
           <span class="chip" onclick="quickPrompt('Get system telemetry')">Telemetry</span>
+          <span class="chip" onclick="quickPrompt('Check background task list')">Background Tasks</span>
         </div>
       </div>
     </div>
 
     <!-- Recent Speech Card -->
     <div class="card" style="grid-column: span 1;">
-      <h2>Audio Speech Archive <button style="background:transparent; color:var(--accent); font-size:12px; padding:0;" onclick="loadRecentAudio()">↻ Refresh</button></h2>
+      <h2>Audio Speech Archive <button style="background:transparent; color:var(--accent); font-size:11px; padding:0;" onclick="loadRecentAudio()">↻ Refresh</button></h2>
       <div id="recent-audio-container" style="max-height: 420px; overflow-y: auto;">
-        <p style="color:var(--muted); font-size:13px;">Loading recent voice responses...</p>
+        <p style="color:var(--muted); font-size:12px;">Loading recent voice responses...</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- Visual Diff & Syntax Verifier Card -->
+    <div class="card">
+      <h2>Recent Code Diffs & Self-Healing <button style="background:transparent; color:var(--accent); font-size:11px; padding:0;" onclick="fetchDiffs()">↻ Refresh</button></h2>
+      <div id="recent-diffs-container" style="max-height: 260px; overflow-y: auto;">
+        <p style="color:var(--muted); font-size:12px;">No recent code edits recorded in session.</p>
+      </div>
+    </div>
+
+    <!-- Background Tasks Console Card -->
+    <div class="card">
+      <h2>Background Tasks & Process Manager <button style="background:transparent; color:var(--accent); font-size:11px; padding:0;" onclick="fetchJobs()">↻ Refresh</button></h2>
+      <div id="recent-jobs-container" style="max-height: 260px; overflow-y: auto;">
+        <p style="color:var(--muted); font-size:12px;">No active background jobs.</p>
       </div>
     </div>
   </div>
@@ -1645,6 +1873,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
   let lastAssistantReply = "";
   let activeAbortController = null;
+  let sparklineHistory = [];
+  let speechRecognizer = null;
+  let isListening = false;
+  let activeApprovalId = null;
 
   async function fetchTelemetry() {
     try {
@@ -1658,35 +1890,229 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       }
       if (data.gpu) {
         document.getElementById('val-gpu-model').textContent = data.gpu.model || '--';
-        document.getElementById('val-gpu-vram').textContent = (data.gpu.vram_used || '') + ' / ' + (data.gpu.vram_total || '');
+        document.getElementById('val-gpu-vram').textContent = (data.gpu.vram_used || '') + ' (' + (data.gpu.temp || '') + ')';
         document.getElementById('val-gpu-util').textContent = data.gpu.utilization || '--';
-        document.getElementById('val-gpu-temp').textContent = data.gpu.temp || '--';
       }
+      const cpuLoad = parseFloat((data.load_avg_1_5_15m || [0])[0]) || 0;
+      let vramMb = 0;
+      if (data.gpu && data.gpu.vram_used) {
+        vramMb = parseFloat(data.gpu.vram_used) || 0;
+      }
+      renderSparkline(cpuLoad, vramMb);
     } catch(e){}
+  }
+
+  function renderSparkline(cpu, vram) {
+    sparklineHistory.push({ cpu: cpu, vram: vram });
+    if (sparklineHistory.length > 30) sparklineHistory.shift();
+
+    const canvas = document.getElementById('telemetry-sparkline');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    if (sparklineHistory.length < 2) return;
+
+    // Draw CPU load line (accent blue)
+    ctx.beginPath();
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 2;
+    const maxCpu = Math.max(4, ...sparklineHistory.map(d => d.cpu));
+    for (let i = 0; i < sparklineHistory.length; i++) {
+      const x = (i / (sparklineHistory.length - 1)) * (w - 10) + 5;
+      const y = h - (sparklineHistory[i].cpu / maxCpu) * (h - 14) - 7;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Draw GPU VRAM line (magenta)
+    ctx.beginPath();
+    ctx.strokeStyle = '#d946ef';
+    ctx.lineWidth = 1.5;
+    const maxVram = Math.max(1000, ...sparklineHistory.map(d => d.vram));
+    for (let i = 0; i < sparklineHistory.length; i++) {
+      const x = (i / (sparklineHistory.length - 1)) * (w - 10) + 5;
+      const y = h - (sparklineHistory[i].vram / maxVram) * (h - 14) - 7;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Legend
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = '10px monospace';
+    ctx.fillText('CPU Load: ' + cpu.toFixed(2), 8, 14);
+    ctx.fillStyle = '#d946ef';
+    ctx.fillText('VRAM: ' + Math.round(vram) + 'MB', 140, 14);
   }
 
   async function fetchMixStats() {
     try {
       const res = await fetch('/api/mix_stats');
       const data = await res.json();
-      if (data.archive_roots) {
-        document.getElementById('val-mix-roots').textContent = data.archive_roots.length + ' configured root(s)';
-      }
-      if (data.total_audio_files) {
-        document.getElementById('val-mix-total').textContent = data.total_audio_files.toLocaleString() + ' files';
-      }
-      if (data.total_storage_gb) {
-        document.getElementById('val-mix-gb').textContent = data.total_storage_gb + ' GB';
-      }
-      if (data.formats) {
-        document.getElementById('val-mix-formats').textContent = Object.entries(data.formats).map(([k,v]) => k.toUpperCase() + ':' + v).join(' | ');
-      }
+      if (data.archive_roots) document.getElementById('val-mix-roots').textContent = data.archive_roots.length + ' root(s)';
+      if (data.total_audio_files) document.getElementById('val-mix-total').textContent = data.total_audio_files.toLocaleString() + ' files';
+      if (data.total_storage_gb) document.getElementById('val-mix-gb').textContent = data.total_storage_gb + ' GB';
+      if (data.formats) document.getElementById('val-mix-formats').textContent = Object.entries(data.formats).map(([k,v]) => k.toUpperCase() + ':' + v).join(' | ');
       if (data.latest_mixes && data.latest_mixes.length) {
         document.getElementById('latest-mixes-list').innerHTML = data.latest_mixes.map(m =>
-          '<div style="padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.05);"><b>' + m.title + '</b> (' + m.size_mb + ' MB) <span style="color:var(--muted);">' + m.date + '</span></div>'
+          '<div style="padding:3px 0; border-bottom:1px solid rgba(255,255,255,0.05);"><b>' + m.title + '</b> (' + m.size_mb + ' MB) <span style="color:var(--muted);">' + m.date + '</span></div>'
         ).join('');
       }
     } catch(e){}
+  }
+
+  async function fetchDiffs() {
+    const container = document.getElementById('recent-diffs-container');
+    try {
+      const res = await fetch('/api/recent_diffs');
+      const data = await res.json();
+      if (!data.diffs || !data.diffs.length) {
+        container.innerHTML = '<p style="color:var(--muted); font-size:12px;">No recent code edits recorded in session.</p>';
+        return;
+      }
+      container.innerHTML = data.diffs.map(d => {
+        const lines = (d.diff || '').split('\\n').slice(0, 15).map(l => {
+          if (l.startsWith('+') && !l.startsWith('+++')) return '<span class="diff-add">' + escapeHtml(l) + '</span>';
+          if (l.startsWith('-') && !l.startsWith('---')) return '<span class="diff-del">' + escapeHtml(l) + '</span>';
+          return escapeHtml(l);
+        }).join('\\n');
+        return `
+          <div class="diff-item">
+            <div style="display:flex; justify-content:space-between; font-size:11px; margin-bottom:4px;">
+              <span><b>${escapeHtml(d.filepath)}</b></span>
+              <span style="color:var(--muted);">${d.timestamp} (+${d.lines_added} / -${d.lines_removed})</span>
+            </div>
+            <div class="diff-box">${lines}</div>
+          </div>
+        `;
+      }).join('');
+    } catch(e) {
+      container.innerHTML = '<p style="color:var(--red); font-size:12px;">Failed to load code diffs.</p>';
+    }
+  }
+
+  async function fetchJobs() {
+    const container = document.getElementById('recent-jobs-container');
+    try {
+      const res = await fetch('/api/jobs');
+      const data = await res.json();
+      if (!data.jobs || !data.jobs.length) {
+        container.innerHTML = '<p style="color:var(--muted); font-size:12px;">No active background jobs.</p>';
+        return;
+      }
+      container.innerHTML = data.jobs.map(j => `
+        <div class="job-row">
+          <div>
+            <b>${escapeHtml(j.job_id)}</b> (PID: ${j.pid || '--'}) - <span style="color:${j.status === 'running' ? 'var(--green)' : 'var(--muted)'};">${j.status.toUpperCase()}</span>
+            <div style="color:var(--muted); font-size:11px;">${escapeHtml(j.command || '')}</div>
+          </div>
+          ${j.status === 'running' ? `<button style="background:var(--red); color:#fff; padding:3px 8px; font-size:11px;" onclick="stopJob('${j.job_id}')">Stop</button>` : ''}
+        </div>
+      `).join('');
+    } catch(e) {
+      container.innerHTML = '<p style="color:var(--red); font-size:12px;">Failed to load jobs.</p>';
+    }
+  }
+
+  async function stopJob(jobId) {
+    await fetch('/api/jobs/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId })
+    });
+    fetchJobs();
+  }
+
+  async function checkApprovals() {
+    try {
+      const res = await fetch('/api/approvals');
+      const data = await res.json();
+      const banner = document.getElementById('approval-banner');
+      if (data.approvals && data.approvals.length > 0) {
+        const app = data.approvals[0];
+        activeApprovalId = app.id;
+        document.getElementById('approval-desc').textContent = 'Tool: ' + app.tool + ' | Args: ' + JSON.stringify(app.kwargs);
+        banner.style.display = 'flex';
+      } else {
+        activeApprovalId = null;
+        banner.style.display = 'none';
+      }
+    } catch(e){}
+  }
+
+  async function respondApproval(decision) {
+    if (!activeApprovalId) return;
+    await fetch('/api/approvals/decision', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: activeApprovalId, decision: decision })
+    });
+    document.getElementById('approval-banner').style.display = 'none';
+  }
+
+  async function toggleHitl() {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    const newHitl = !data.require_approval;
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ require_approval: newHitl })
+    });
+    updateHitlBadge(newHitl);
+  }
+
+  function updateHitlBadge(active) {
+    const b = document.getElementById('badge-hitl');
+    if (active) {
+      b.textContent = '🛡️ HITL APPROVAL: ON';
+      b.className = 'badge badge-hitl active';
+    } else {
+      b.textContent = '🛡️ HITL APPROVAL: OFF';
+      b.className = 'badge badge-hitl';
+    }
+  }
+
+  function toggleDictation() {
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRec) {
+      alert("Web Speech API not supported in this browser. Try Chrome/Edge or use local-voice-talk.");
+      return;
+    }
+    const mic = document.getElementById('mic-btn');
+    if (isListening && speechRecognizer) {
+      speechRecognizer.stop();
+      isListening = false;
+      mic.classList.remove('recording');
+      return;
+    }
+    speechRecognizer = new SpeechRec();
+    speechRecognizer.continuous = false;
+    speechRecognizer.interimResults = true;
+    speechRecognizer.lang = 'en-US';
+
+    speechRecognizer.onstart = () => {
+      isListening = true;
+      mic.classList.add('recording');
+      document.getElementById('prompt-input').placeholder = "Listening... speak now...";
+    };
+    speechRecognizer.onresult = (e) => {
+      let text = "";
+      for (let i = e.resultIndex; i < e.results.length; ++i) {
+        text += e.results[i][0].transcript;
+      }
+      document.getElementById('prompt-input').value = text;
+    };
+    speechRecognizer.onend = () => {
+      isListening = false;
+      mic.classList.remove('recording');
+      document.getElementById('prompt-input').placeholder = "Ask MP Harmony Agent anything...";
+      const val = document.getElementById('prompt-input').value.trim();
+      if (val) sendChat();
+    };
+    speechRecognizer.start();
   }
 
   async function loadRecentAudio() {
@@ -1695,7 +2121,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       const res = await fetch('/api/recent_audio');
       const data = await res.json();
       if (!data.audio_responses || !data.audio_responses.length) {
-        container.innerHTML = '<p style="color:var(--muted); font-size:13px;">No recorded audio files found.</p>';
+        container.innerHTML = '<p style="color:var(--muted); font-size:12px;">No recorded audio files found.</p>';
         return;
       }
       container.innerHTML = data.audio_responses.map(item => `
@@ -1704,12 +2130,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <span>${item.filename}</span>
             <span>${item.mtime}</span>
           </div>
-          <div class="audio-transcript">${item.transcript ? '"' + item.transcript + '"' : '(No transcript)'}</div>
+          <div class="audio-transcript">${item.transcript ? '"' + escapeHtml(item.transcript) + '"' : '(No transcript)'}</div>
           <audio controls preload="none" src="/audio/${item.filename}"></audio>
         </div>
       `).join('');
     } catch(e) {
-      container.innerHTML = '<p style="color:var(--red); font-size:13px;">Error loading audio archive.</p>';
+      container.innerHTML = '<p style="color:var(--red); font-size:12px;">Error loading audio archive.</p>';
     }
   }
 
@@ -1773,6 +2199,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         out.textContent = content;
         lastAssistantReply = content;
       }
+
+      if (document.getElementById('auto-speak-toggle').checked && lastAssistantReply) {
+        speakResponse();
+      }
     } catch (e) {
       if (e.name !== 'AbortError') {
         out.textContent += "\\n[Error: " + e.message + "]";
@@ -1783,6 +2213,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('send-btn').style.display = 'inline-block';
       document.getElementById('abort-btn').style.display = 'none';
       loadRecentAudio();
+      fetchDiffs();
+      fetchJobs();
     }
   }
 
@@ -1808,6 +2240,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     }
   }
 
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   document.getElementById('prompt-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -1818,7 +2255,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   fetchTelemetry();
   fetchMixStats();
   loadRecentAudio();
-  setInterval(fetchTelemetry, 5000);
+  fetchDiffs();
+  fetchJobs();
+  setInterval(fetchTelemetry, 4000);
+  setInterval(checkApprovals, 2000);
 </script>
 </body>
 </html>
@@ -2035,6 +2475,72 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # 6b. Recent Diffs API: /api/recent_diffs
+        if path == "/api/recent_diffs":
+            with _DIFF_LOCK:
+                diffs_copy = list(_RECENT_DIFFS)
+            body = json.dumps({"diffs": diffs_copy}).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 6c. Background Jobs API: /api/jobs
+        if path == "/api/jobs":
+            jobs = []
+            if os.path.exists(JOBS_DIR):
+                for f in sorted(os.listdir(JOBS_DIR), reverse=True):
+                    if f.endswith(".meta"):
+                        jid = f[:-5]
+                        info = check_background_task(jid, tail_lines=5)
+                        meta_path = os.path.join(JOBS_DIR, f)
+                        try:
+                            with open(meta_path, "r") as mf:
+                                meta = json.load(mf)
+                                info["command"] = meta.get("command", "")
+                                info["started_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(meta.get("started_at", 0)))
+                        except Exception:
+                            pass
+                        jobs.append(info)
+            body = json.dumps({"jobs": jobs}).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 6d. Approvals Queue API: /api/approvals
+        if path == "/api/approvals":
+            with _APPROVAL_LOCK:
+                apps = [
+                    {"id": k, "tool": v["tool"], "kwargs": v["kwargs"], "time": v["time"], "status": v["status"]}
+                    for k, v in _PENDING_APPROVALS.items()
+                ]
+            body = json.dumps({"approvals": apps}).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 6e. Settings API: /api/settings
+        if path == "/api/settings":
+            body = json.dumps({"require_approval": REQUIRE_APPROVAL, "auto_archive": AUDIO_AUTO_ARCHIVE}).encode("utf-8")
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         # 7. Web HUD & Diagnostic Dashboard: / or /dashboard or /hud
         if path in ("/", "/dashboard", "/hud"):
             accept = self.headers.get("Accept", "")
@@ -2154,6 +2660,59 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(wav_bytes)))
             self.end_headers()
             self.wfile.write(wav_bytes)
+            return
+
+        # 3. Decision for Human Approval
+        if path == "/api/approvals/decision":
+            content_length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length > 0 else {}
+            app_id = data.get("id")
+            decision = data.get("decision", "deny")
+            with _APPROVAL_LOCK:
+                if app_id in _PENDING_APPROVALS:
+                    entry = _PENDING_APPROVALS[app_id]
+                    entry["status"] = "approved" if decision == "approve" else "rejected"
+                    entry["event"].set()
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            body = b'{"status":"ok"}'
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 4. Settings Update API
+        if path == "/api/settings":
+            content_length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length > 0 else {}
+            global REQUIRE_APPROVAL, AUDIO_AUTO_ARCHIVE
+            if "require_approval" in data:
+                REQUIRE_APPROVAL = bool(data["require_approval"])
+            if "auto_archive" in data:
+                AUDIO_AUTO_ARCHIVE = bool(data["auto_archive"])
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            body = json.dumps({"require_approval": REQUIRE_APPROVAL, "auto_archive": AUDIO_AUTO_ARCHIVE}).encode("utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 5. Background Job Termination API
+        if path == "/api/jobs/stop":
+            content_length = int(self.headers.get("Content-Length", 0))
+            data = json.loads(self.rfile.read(content_length).decode("utf-8")) if content_length > 0 else {}
+            jid = data.get("job_id", "")
+            res = stop_background_task(jid)
+            self.send_response(200)
+            self.send_cors_headers()
+            self.send_header("Content-Type", "application/json")
+            body = json.dumps(res).encode("utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if path not in ("/v1/chat/completions", "/chat/completions"):
@@ -2335,25 +2894,54 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
                     parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
                     convo.messages.extend(parsed_messages)
 
-                    tool_called = False
+                    tool_requests = []
                     for msg in parsed_messages:
                         if msg.recipient and msg.recipient.startswith("functions."):
-                            tool_called = True
                             func_name = msg.recipient.split("functions.", 1)[1]
                             raw_args = extract_content_text(msg)
                             try:
                                 kwargs = json.loads(raw_args)
                             except Exception:
                                 kwargs = {}
+                            tool_requests.append((func_name, kwargs))
 
-                            print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
-                            print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
+                    if tool_requests:
+                        tool_called = True
+                        if len(tool_requests) > 1:
+                            print(f"\n\033[1;36m[Parallel Execution]\033[0m Dispatching {len(tool_requests)} tool calls concurrently...")
+                            with ThreadPoolExecutor(max_workers=min(len(tool_requests), 4)) as executor:
+                                future_to_idx = {
+                                    executor.submit(dispatch_tool, name, args): (i, name, args)
+                                    for i, (name, args) in enumerate(tool_requests)
+                                }
+                                ordered_results = [None] * len(tool_requests)
+                                for future in as_completed(future_to_idx):
+                                    idx, name, args = future_to_idx[future]
+                                    try:
+                                        res = future.result()
+                                    except Exception as e:
+                                        res = {"error": f"Tool execution error: {str(e)}"}
+                                    ordered_results[idx] = (name, res)
 
-                            res = dispatch_tool(func_name, kwargs)
+                            for name, res in ordered_results:
+                                preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
+                                print(f"\033[1;33m[Tool Dispatch (Parallel)]\033[0m {name}")
+                                print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
+                                convo.messages.append(Message.from_author_and_content(
+                                    author=Author.new(Role.TOOL, f"functions.{name}"),
+                                    content=json.dumps(res)
+                                ))
+                        else:
+                            name, args = tool_requests[0]
+                            print(f"\n\033[1;33m[Tool Dispatch]\033[0m {name}")
+                            print(f"\033[1;30mArgs: {json.dumps(args, indent=2)}\033[0m")
+                            res = dispatch_tool(name, args)
                             preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
                             print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
-
-                            convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
+                            convo.messages.append(Message.from_author_and_content(
+                                author=Author.new(Role.TOOL, f"functions.{name}"),
+                                content=json.dumps(res)
+                            ))
 
                     if not tool_called:
                         break
@@ -2484,11 +3072,15 @@ def print_banner(model_name: str, model_info: dict):
     print(f" \033[1mNative Context\033[0m    : {ctx_len}")
     print(f" \033[1mTools Active\033[0m      : {len(AVAILABLE_TOOLS)} registered (diff, telemetry, jobs, memory, git, web, audio)")
     print(f" \033[1mAudio Archive\033[0m     : {AUDIO_OUTPUT_DIR} (auto-archive: {'ON' if AUDIO_AUTO_ARCHIVE else 'OFF'})")
-    print(f" \033[1mGuardrails\033[0m        : safe_mode={'ON' if SAFE_MODE else 'OFF'} | auto-pruner={PRUNE_THRESHOLD} tok")
+    print(f" \033[1mGuardrails\033[0m        : safe_mode={'ON' if SAFE_MODE else 'OFF'} | HITL={'ON' if REQUIRE_APPROVAL else 'OFF'} | auto-pruner={PRUNE_THRESHOLD} tok")
     print("\033[1;36m----------------------------------------------------------------------\033[0m")
 
 
 def main():
+    global REQUIRE_APPROVAL
+    if "--require-approval" in sys.argv:
+        REQUIRE_APPROVAL = True
+
     model_name = detect_ollama_model()
     model_info = get_ollama_model_info(model_name)
     if not model_info:
@@ -2561,25 +3153,54 @@ def main():
             parsed_messages = enc.parse_messages_from_completion_tokens(resp_tokens, role=Role.ASSISTANT)
             convo.messages.extend(parsed_messages)
 
-            tool_called = False
+            tool_requests = []
             for msg in parsed_messages:
                 if msg.recipient and msg.recipient.startswith("functions."):
-                    tool_called = True
                     func_name = msg.recipient.split("functions.", 1)[1]
                     raw_args = extract_content_text(msg)
                     try:
                         kwargs = json.loads(raw_args)
                     except Exception:
                         kwargs = {}
+                    tool_requests.append((func_name, kwargs))
 
-                    print(f"\n\033[1;33m[Tool Dispatch]\033[0m {func_name}")
-                    print(f"\033[1;30mArgs: {json.dumps(kwargs, indent=2)}\033[0m")
+            if tool_requests:
+                tool_called = True
+                if len(tool_requests) > 1:
+                    print(f"\n\033[1;36m[Parallel Execution]\033[0m Dispatching {len(tool_requests)} tool calls concurrently...")
+                    with ThreadPoolExecutor(max_workers=min(len(tool_requests), 4)) as executor:
+                        future_to_idx = {
+                            executor.submit(dispatch_tool, name, args): (i, name, args)
+                            for i, (name, args) in enumerate(tool_requests)
+                        }
+                        ordered_results = [None] * len(tool_requests)
+                        for future in as_completed(future_to_idx):
+                            idx, name, args = future_to_idx[future]
+                            try:
+                                res = future.result()
+                            except Exception as e:
+                                res = {"error": f"Tool execution error: {str(e)}"}
+                            ordered_results[idx] = (name, res)
 
-                    res = dispatch_tool(func_name, kwargs)
+                    for name, res in ordered_results:
+                        preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
+                        print(f"\033[1;33m[Tool Dispatch (Parallel)]\033[0m {name}")
+                        print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
+                        convo.messages.append(Message.from_author_and_content(
+                            author=Author.new(Role.TOOL, f"functions.{name}"),
+                            content=json.dumps(res)
+                        ))
+                else:
+                    name, args = tool_requests[0]
+                    print(f"\n\033[1;33m[Tool Dispatch]\033[0m {name}")
+                    print(f"\033[1;30mArgs: {json.dumps(args, indent=2)}\033[0m")
+                    res = dispatch_tool(name, args)
                     preview = str(res)[:500] + ("..." if len(str(res)) > 500 else "")
                     print(f"\033[1;32m[Tool Result]\033[0m {preview}\n")
-
-                    convo.messages.append(Message.from_author_and_content(author=Author.new(Role.TOOL, f"functions.{func_name}"), content=json.dumps(res)))
+                    convo.messages.append(Message.from_author_and_content(
+                        author=Author.new(Role.TOOL, f"functions.{name}"),
+                        content=json.dumps(res)
+                    ))
 
             if not tool_called:
                 for msg in parsed_messages:
