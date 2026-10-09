@@ -31,11 +31,11 @@ from openai_harmony import (
 # ---------------------------------------------------------------------------
 # Global Settings & Configuration
 # ---------------------------------------------------------------------------
-AGENT_PORT = 11435
-NUM_CTX = 8192
-NUM_PREDICT = 4096
-PRUNE_THRESHOLD = 6000
-MAX_STEPS = 16
+AGENT_PORT = int(os.getenv("HARMONY_AGENT_PORT", "11435"))
+NUM_CTX = int(os.getenv("HARMONY_NUM_CTX", "4096"))
+NUM_PREDICT = int(os.getenv("HARMONY_NUM_PREDICT", "2048"))
+PRUNE_THRESHOLD = int(os.getenv("HARMONY_PRUNE_THRESHOLD", str(min(3200, int(NUM_CTX * 0.75)))))
+MAX_STEPS = int(os.getenv("HARMONY_MAX_STEPS", "16"))
 SAFE_MODE = True
 MEMORY_FILE = os.path.expanduser("~/.harmony_memory.json")
 JOBS_DIR = "/tmp/ha_jobs"
@@ -1306,6 +1306,9 @@ tool_schemas = [
 # 3. Model Inspection, Encodings & Live Streaming Pipeline
 # ---------------------------------------------------------------------------
 def detect_ollama_model() -> str:
+    env_model = os.getenv("HARMONY_MODEL", "").strip()
+    if env_model:
+        return env_model
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if args:
         return args[0].strip("'\" ;\t\r\n")
@@ -1382,7 +1385,13 @@ def stream_ollama_with_callback(prompt_text: str, model_name: str, on_token=None
         },
     ) as response:
         if response.status_code != 200:
-            raise RuntimeError(f"Ollama error {response.status_code}: {response.text}")
+            error_body = response.read().decode("utf-8", errors="replace")
+            try:
+                err_json = json.loads(error_body)
+                err_msg = err_json.get("error", error_body)
+            except Exception:
+                err_msg = error_body
+            raise RuntimeError(f"Ollama error {response.status_code}: {err_msg}")
         for line in response.iter_lines():
             if stop_event and stop_event.is_set():
                 print("\n\033[1;31m[Inference Aborted]\033[0m")
@@ -1390,6 +1399,8 @@ def stream_ollama_with_callback(prompt_text: str, model_name: str, on_token=None
             if not line:
                 continue
             chunk = json.loads(line)
+            if "error" in chunk:
+                raise RuntimeError(f"Ollama error: {chunk['error']}")
             piece = chunk.get("response", "")
             print(piece, end="", flush=True)
             full.append(piece)
