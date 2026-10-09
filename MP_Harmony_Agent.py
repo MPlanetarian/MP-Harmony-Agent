@@ -31,6 +31,8 @@ from openai_harmony import (
 # ---------------------------------------------------------------------------
 # Global Settings & Configuration
 # ---------------------------------------------------------------------------
+VERSION = "1.0.0"
+AUTHOR = "Dreamworlds Productions (MPlanetarian)"
 AGENT_PORT = int(os.getenv("HARMONY_AGENT_PORT", "11435"))
 NUM_CTX = int(os.getenv("HARMONY_NUM_CTX", "4096"))
 NUM_PREDICT = int(os.getenv("HARMONY_NUM_PREDICT", "2048"))
@@ -1568,8 +1570,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="title-group">
       <div class="logo">H</div>
       <div>
-        <h1>MP Harmony AI Agent</h1>
-        <p style="font-size: 13px; color: var(--muted);">Autonomous Engineering & DJ Studio Engine</p>
+        <h1>MP Harmony AI Agent <span style="font-size: 14px; font-weight: normal; color: var(--accent);">v1.0.0</span></h1>
+        <p style="font-size: 13px; color: var(--muted);">by Dreamworlds Productions (MPlanetarian) • Autonomous Engineering & DJ Studio Engine</p>
       </div>
     </div>
     <div class="badges">
@@ -2017,6 +2019,8 @@ class HarmonyBridgeHandler(BaseHTTPRequestHandler):
             resp = {
                 "status": "online",
                 "agent": "MP Harmony AI Agent",
+                "version": VERSION,
+                "author": AUTHOR,
                 "model": model_name,
                 "port": AGENT_PORT,
                 "tools_count": len(AVAILABLE_TOOLS),
@@ -2473,7 +2477,7 @@ def print_banner(model_name: str, model_info: dict):
     ctx_len = next((f"{v:,} tokens" for k, v in raw_info.items() if k.endswith(".context_length")), "Unknown")
 
     print("\033[1;36m======================================================================\033[0m")
-    print("\033[1;37m   OpenAI Harmony Advanced Autonomous Engineering Agent\033[0m")
+    print(f"\033[1;37m   MP Harmony Agent v{VERSION} by {AUTHOR}\033[0m")
     print("\033[1;36m======================================================================\033[0m")
     print(f" \033[1mModel Tag\033[0m         : \033[1;32m{model_name}\033[0m")
     print(f" \033[1mArchitecture\033[0m      : {arch.upper()} | {param_size} | {quant}")

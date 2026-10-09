@@ -1,7 +1,11 @@
-# MP Harmony Agent (`MP_Harmony_Agent.py`)
+# MP Harmony Agent v1.0.0 by Dreamworlds Productions (MPlanetarian)
 
-> 📅 **Last Updated:** October 9, 2026
+> 📅 **Last Updated:** October 9, 2026  
+> 🏷️ **Version:** v1.0.0  
+> 👤 **Author:** Dreamworlds Productions (MPlanetarian)
 
+[![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](#)
+[![Author](https://img.shields.io/badge/author-Dreamworlds%20Productions%20(MPlanetarian)-purple.svg)](#)
 [![Last Updated](https://img.shields.io/badge/last%20updated-October%209%2C%202026-brightgreen.svg)](#)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OpenAI Harmony](https://img.shields.io/badge/protocol-OpenAI%20Harmony-orange.svg)](https://github.com/openai/harmony)
